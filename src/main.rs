@@ -3,28 +3,46 @@
 #![feature(type_alias_impl_trait)]
 #![feature(associated_type_defaults)]
 #![feature(trait_alias)]
+#![allow(clippy::type_complexity)]
 mod heartbeat;
 mod util;
 
 extern crate alloc;
 extern crate rp2040_hal as hal;
-use {defmt::Format, defmt_rtt as _, panic_probe as _};
+use {
+    defmt::Format,
+    defmt_rtt as _, panic_probe as _,
+    serde::{Deserialize, Serialize},
+};
 
 #[rtic::app(
     device = hal::pac,
     dispatchers = [TIMER_IRQ_1, TIMER_IRQ_2]
 )]
 mod rtic_rp2040_uart {
-    use alloc::{boxed::Box, format, string::ToString};
+    // The linker will place this boot block at the start of our program image.
+    // We need this to help the ROM bootloader get our code up and running.
+    #[link_section = ".boot2"]
+    #[used]
+    pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+    const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
+
     #[global_allocator]
     static HEAP: embedded_alloc::Heap = embedded_alloc::Heap::empty();
+    const HEAP_SIZE_BYTES: usize = 16384; // 16 KB
+    static mut HEAP_MEM: [core::mem::MaybeUninit<u8>; HEAP_SIZE_BYTES] =
+        [core::mem::MaybeUninit::uninit(); HEAP_SIZE_BYTES];
 
+    use alloc::boxed::Box;
     use defmt::{debug, info};
+    use embedded_io::{Read, Write};
     use hal::{
         clocks::{init_clocks_and_plls, Clock},
         fugit::RateExtU32,
         gpio, pwm, sio, uart, usb, Sio, Watchdog,
     };
+    use rtic_monotonics::{rp2040::prelude::*, Monotonic};
     use usb_device::{
         bus::UsbBusAllocator,
         device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
@@ -36,33 +54,18 @@ mod rtic_rp2040_uart {
         UsbHidError,
     };
 
-    use rtic_monotonics::{rp2040::prelude::*, Monotonic};
+    use crate::{
+        heartbeat::HeartbeatLED, KeyMatrixScanRequest, KeyMatrixScanResponse, Message, Mode,
+        Payload,
+    };
+
     rp2040_timer_monotonic!(Mono);
 
-    use crate::{heartbeat::HeartbeatLED, Mode};
-
-    // The linker will place this boot block at the start of our program image.
-    // We need this to help the ROM bootloader get our code up and running.
-    #[link_section = ".boot2"]
-    #[used]
-    pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-    const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
+    const UART_BUFFER_SIZE_BYTES: usize = core::mem::size_of::<Message>();
 
     #[shared]
     struct Shared {
-        usb_device: UsbDevice<'static, usb::UsbBus>,
-        usb_keyboard: UsbHidClass<
-            'static,
-            usb::UsbBus,
-            frunk::HList!(NKROBootKeyboard<'static, usb::UsbBus>),
-        >,
         is_usb_connected: bool,
-    }
-
-    #[local]
-    struct Local {
-        heartbeat_led: HeartbeatLED,
         uart_writer: uart::Writer<
             hal::pac::UART0,
             (
@@ -70,6 +73,17 @@ mod rtic_rp2040_uart {
                 gpio::Pin<gpio::bank0::Gpio1, gpio::FunctionUart, gpio::PullDown>,
             ),
         >,
+        usb_device: UsbDevice<'static, usb::UsbBus>,
+        usb_keyboard: UsbHidClass<
+            'static,
+            usb::UsbBus,
+            frunk::HList!(NKROBootKeyboard<'static, usb::UsbBus>),
+        >,
+    }
+
+    #[local]
+    struct Local {
+        heartbeat_led: HeartbeatLED,
         uart_reader: uart::Reader<
             hal::pac::UART0,
             (
@@ -85,18 +99,10 @@ mod rtic_rp2040_uart {
 
         // Soft-reset does not release the hardware spinlocks.
         // Release them now to avoid a deadlock after debug or watchdog reset.
-        unsafe {
-            sio::spinlock_reset();
-        }
+        unsafe { sio::spinlock_reset() }
 
         // Initialize global memory allocator
-        {
-            use core::mem::MaybeUninit;
-            const HEAP_COUNT: usize = 2048;
-            static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_COUNT] =
-                [MaybeUninit::uninit(); HEAP_COUNT];
-            unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_COUNT) }
-        }
+        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE_BYTES) }
 
         // Set the ARM SLEEPONEXIT bit to go to sleep after handling interrupts
         // See https://developer.arm.com/docs/100737/0100/power-management/sleep-mode/sleep-on-exit-bit
@@ -180,19 +186,16 @@ mod rtic_rp2040_uart {
         hid_usb_tick::spawn().ok();
         begin_wait_usb::spawn(500.millis()).ok();
 
-        info!("enable interrupts");
-        unsafe { hal::pac::NVIC::unmask(hal::pac::Interrupt::USBCTRL_IRQ) };
-
         info!("init() done");
         (
             Shared {
+                is_usb_connected: false,
+                uart_writer,
                 usb_device,
                 usb_keyboard,
-                is_usb_connected: false,
             },
             Local {
                 heartbeat_led,
-                uart_writer,
                 uart_reader,
             },
         )
@@ -213,6 +216,8 @@ mod rtic_rp2040_uart {
         timeout: <Mono as Monotonic>::Duration,
     ) {
         info!("begin_wait_usb()");
+        unsafe { hal::pac::NVIC::unmask(hal::pac::Interrupt::USBCTRL_IRQ) }
+
         Mono::delay(timeout).await;
 
         ctx.shared.is_usb_connected.lock(|is_usb_connected| {
@@ -233,7 +238,11 @@ mod rtic_rp2040_uart {
             Mode::Slave => 500.millis(),
         })
         .ok();
-        write_uart::spawn(mode).ok();
+        match mode {
+            Mode::Master => master::spawn().ok(),
+            Mode::Slave => slave::spawn().ok(),
+        };
+        unsafe { hal::pac::NVIC::unmask(hal::pac::Interrupt::UART0_IRQ) }
     }
 
     #[task(local=[heartbeat_led], priority = 2)]
@@ -242,35 +251,51 @@ mod rtic_rp2040_uart {
         ctx.local.heartbeat_led.cycle(period).await
     }
 
-    #[task(local=[uart_writer], priority = 1)]
-    async fn write_uart(ctx: write_uart::Context, mode: Mode) {
-        info!("write_uart(): {}", mode);
+    #[task(shared=[uart_writer], priority = 1)]
+    async fn master(mut ctx: master::Context) {
+        info!("master()");
 
-        match mode {
-            Mode::Master => {
-                let mut counter: u32 = 0;
-                loop {
-                    let s = format!("counter: {counter}").to_string();
-                    let payload = s.as_bytes();
+        let mut counter: u32 = 0;
+        loop {
+            let message = Message {
+                counter,
+                payload: if counter % 10 < 3 {
+                    Payload::None
+                } else if counter % 10 < 6 {
+                    Payload::KeyMatrixScanRequest(KeyMatrixScanRequest {})
+                } else {
+                    Payload::KeyMatrixScanResponse(KeyMatrixScanResponse { pressed: true })
+                },
+            };
 
-                    debug!("sending: [{}]", core::str::from_utf8(payload).unwrap());
-                    ctx.local.uart_writer.write_full_blocking(payload);
+            debug!("sending: [{}]", message);
 
-                    Mono::delay(500.millis()).await;
-                    counter = counter.wrapping_add(1);
-                }
-            }
-            Mode::Slave => unsafe { hal::pac::NVIC::unmask(hal::pac::Interrupt::UART0_IRQ) },
+            ctx.shared.uart_writer.lock(|uart_writer| {
+                let mut buf = [0u8; UART_BUFFER_SIZE_BYTES];
+                uart_writer
+                    .write(postcard::to_slice(&message, &mut buf).unwrap())
+                    .unwrap();
+            });
+
+            Mono::delay(500.millis()).await;
+            counter = counter.wrapping_add(1);
         }
     }
 
+    #[task(shared=[uart_writer], priority = 1)]
+    async fn slave(_: slave::Context) {
+        info!("slave()");
+    }
+
     #[task(binds = UART0_IRQ, local = [uart_reader], priority = 1)]
-    fn read_uart(ctx: read_uart::Context) {
-        let mut payload = [0; 32];
-        if ctx.local.uart_reader.read_raw(&mut payload).is_err() {
+    fn receive_uart(ctx: receive_uart::Context) {
+        let mut buf = [0; UART_BUFFER_SIZE_BYTES];
+        if ctx.local.uart_reader.read(&mut buf).is_err() {
             return;
         }
-        debug!("receiving: [{}]", core::str::from_utf8(&payload).unwrap());
+
+        let message: Message = postcard::from_bytes(&buf).unwrap();
+        debug!("receiving: [{}]", message);
     }
 
     #[task(binds = USBCTRL_IRQ, shared = [usb_device, usb_keyboard, is_usb_connected], priority = 1)]
@@ -321,4 +346,34 @@ mod rtic_rp2040_uart {
 enum Mode {
     Master,
     Slave,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
+struct Message {
+    counter: u32,
+    payload: Payload,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Format, Serialize)]
+enum Payload {
+    #[default]
+    None,
+    PingRequest(PingRequest),
+    PingResponse(PingResponse),
+    KeyMatrixScanRequest(KeyMatrixScanRequest),
+    KeyMatrixScanResponse(KeyMatrixScanResponse),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
+struct PingRequest {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
+struct PingResponse {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
+struct KeyMatrixScanRequest {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
+struct KeyMatrixScanResponse {
+    pressed: bool,
 }
