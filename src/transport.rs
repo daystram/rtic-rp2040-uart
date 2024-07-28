@@ -1,13 +1,14 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
-use defmt::{trace, Format};
-use embedded_io::{Read, Write};
+use defmt::{error, trace, Format};
+use embedded_io::Write;
 use hal::{
     gpio,
     uart::{self, Reader, UartPeripheral, Writer},
 };
 use rtic_monotonics::{rp2040::prelude::*, Monotonic};
+use rtic_sync::channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
 use crate::{kb::Mono, ping::PingResponse};
@@ -18,17 +19,21 @@ static SOCKET_BUFFER: Mutex<RefCell<[Option<Packet>; SequenceNumber::MAX as usiz
     Mutex::new(RefCell::new([None; SequenceNumber::MAX as usize + 1]));
 static FUNCTION_REGISTRY: Mutex<RefCell<[Option<Function>; FunctionId::MAX as usize + 1]>> =
     Mutex::new(RefCell::new([None; FunctionId::MAX as usize + 1]));
-static mut INCOMING_PACKET_SEQUENCE_NUMBER: Option<SequenceNumber> = None;
 
 type Function = fn(&[u8]) -> Vec<u8>;
 
-pub struct RemoteExecutor {}
+pub struct RemoteExecutor {
+    sequence_number_receiver: Receiver<'static, SequenceNumber, 1>,
+}
 
 impl RemoteExecutor {
-    pub fn new() -> Self {
-        RemoteExecutor {}
+    pub fn new(sequence_number_receiver: Receiver<'static, SequenceNumber, 1>) -> Self {
+        RemoteExecutor {
+            sequence_number_receiver,
+        }
     }
 
+    // TODO: consider how to accept an impl method for mutable reference
     pub fn register_function(&mut self, function_id: FunctionId, function: Function) {
         cortex_m::interrupt::free(|cs| {
             FUNCTION_REGISTRY.borrow(cs).borrow_mut()[function_id as usize] = Some(function);
@@ -36,31 +41,40 @@ impl RemoteExecutor {
     }
 
     pub async fn listen(&mut self, client: &RefCell<UartTransport>) {
-        let sequence_number = match unsafe { INCOMING_PACKET_SEQUENCE_NUMBER } {
-            Some(sequence_number) => sequence_number,
-            None => return,
-        };
+        while let Ok(sequence_number) = self.sequence_number_receiver.recv().await {
+            // parse request payload
+            let packet = match cortex_m::interrupt::free(|cs| {
+                SOCKET_BUFFER.borrow(cs).borrow()[sequence_number as usize]
+            }) {
+                Some(packet) => packet,
+                None => {
+                    error!("packet not found in buffer: seq={}", sequence_number);
+                    return;
+                }
+            };
+            let function = match cortex_m::interrupt::free(|cs| {
+                FUNCTION_REGISTRY.borrow(cs).borrow()[packet.function_id as usize]
+            }) {
+                Some(function) => function,
+                None => {
+                    error!(
+                        "function handler not registered: seq={} function_id={}",
+                        packet.sequence_number, packet.function_id
+                    );
+                    return;
+                }
+            };
 
-        let packet = match cortex_m::interrupt::free(|cs| {
-            SOCKET_BUFFER.borrow(cs).borrow()[sequence_number as usize]
-        }) {
-            Some(packet) => packet,
-            None => return,
-        };
+            // execute function
+            let res = function(packet.payload);
 
-        let function = match cortex_m::interrupt::free(|cs| {
-            FUNCTION_REGISTRY.borrow(cs).borrow()[packet.function_id as usize]
-        }) {
-            Some(function) => function,
-            None => return,
-        };
-
-        let res = function(packet.payload);
-        client
-            .borrow_mut()
-            .send_packet(packet.sequence_number, packet.function_id, res.as_slice());
-
-        unsafe { INCOMING_PACKET_SEQUENCE_NUMBER = None };
+            // return response
+            client.borrow_mut().send_packet(
+                packet.sequence_number,
+                packet.function_id,
+                res.as_slice(),
+            );
+        }
     }
 }
 
@@ -72,6 +86,7 @@ pub struct UartReceiver {
             gpio::Pin<gpio::bank0::Gpio1, gpio::FunctionUart, gpio::PullDown>,
         ),
     >,
+    sequence_number_sender: Sender<'static, SequenceNumber, 1>,
 }
 
 impl UartReceiver {
@@ -83,9 +98,18 @@ impl UartReceiver {
                 gpio::Pin<gpio::bank0::Gpio1, gpio::FunctionUart, gpio::PullDown>,
             ),
         >,
-    ) -> Self {
+    ) -> (Self, Receiver<'static, SequenceNumber, 1>) {
+        let (sequence_number_sender, sequence_number_receiver) =
+            rtic_sync::make_channel!(SequenceNumber, 1);
+
         uart_reader.enable_rx_interrupt();
-        UartReceiver { uart_reader }
+        (
+            UartReceiver {
+                uart_reader,
+                sequence_number_sender,
+            },
+            sequence_number_receiver,
+        )
     }
 
     pub fn read_into_buffer(&mut self) {
@@ -107,8 +131,19 @@ impl UartReceiver {
                 function_id: packet.function_id,
                 payload: Box::leak(packet.payload.to_vec().into_boxed_slice()),
             });
-            unsafe { INCOMING_PACKET_SEQUENCE_NUMBER = Some(packet.sequence_number) };
         });
+
+        // TODO: add packet type (req/res) and only push to queue for req
+        if self
+            .sequence_number_sender
+            .try_send(packet.sequence_number)
+            .is_err()
+        {
+            error!(
+                "request queue is full, request dropped: seq={}",
+                packet.sequence_number
+            );
+        };
     }
 }
 
@@ -122,6 +157,7 @@ pub struct UartTransport {
     >,
 }
 
+//  TODO: reconsider structure
 impl UartTransport {
     pub fn new(
         mut uart_writer: Writer<
@@ -144,6 +180,7 @@ impl UartTransport {
         }
     }
 
+    // TODO: take packet as param
     fn send_packet(
         &mut self,
         sequence_number: SequenceNumber,
@@ -180,7 +217,7 @@ impl UartTransport {
                 trace!("receiving: [{}]", response);
                 break response;
             }
-            Mono::delay(500.millis()).await;
+            Mono::delay(500.micros()).await;
         }
     }
 }
@@ -225,9 +262,4 @@ pub struct Packet<'a> {
     sequence_number: SequenceNumber,
     function_id: FunctionId,
     payload: &'a [u8],
-}
-
-#[derive(Debug, Format)]
-enum Err {
-    ReadErrorType(#[defmt(Debug2Format)] uart::ReadErrorType),
 }

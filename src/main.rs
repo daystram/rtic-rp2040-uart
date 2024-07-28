@@ -228,7 +228,7 @@ mod kb {
         .unwrap();
         let (uart_reader, uart_writer) = uart_peripheral.split();
         let remote_invoker = RefCell::new(UartTransport::new(uart_writer));
-        let uart_receiver = UartReceiver::new(uart_reader);
+        let (uart_receiver, sequence_number_receiver) = UartReceiver::new(uart_reader);
 
         // Init keyboard
         // let key_matrix = Some(SplitSwitchMatrix::new(BasicVerticalSwitchMatrix::new(
@@ -246,7 +246,7 @@ mod kb {
         let ping = Some(Ping::new());
 
         // Initialize remote executor and register functions
-        let mut remote_executor = RemoteExecutor::new();
+        let mut remote_executor = RemoteExecutor::new(sequence_number_receiver);
         remote_executor.register_function(FUNCTION_ID_PING, Ping::ping_remote);
 
         // Begin
@@ -364,13 +364,10 @@ mod kb {
     #[task (shared=[&remote_invoker], local=[remote_executor], priority = 1)]
     async fn slave_server(ctx: slave_server::Context) {
         info!("slave_server()");
-        loop {
-            ctx.local
-                .remote_executor
-                .listen(ctx.shared.remote_invoker)
-                .await;
-            Mono::delay(1.millis()).await; // TOOD: poll?
-        }
+        ctx.local
+            .remote_executor
+            .listen(ctx.shared.remote_invoker)
+            .await;
     }
     // ============================= Slave
 
