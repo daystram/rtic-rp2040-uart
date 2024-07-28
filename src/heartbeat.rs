@@ -3,7 +3,7 @@ use embedded_hal::pwm::SetDutyCycle;
 use hal::gpio;
 use rtic_monotonics::Monotonic;
 
-use crate::{rtic_rp2040_uart::Mono, util};
+use crate::{kb::Mono, util};
 
 const MAX_PWM_POWER: u16 = 0x6000;
 const STEP: u16 = 1;
@@ -17,7 +17,7 @@ impl HeartbeatLED {
         HeartbeatLED { pin }
     }
 
-    pub async fn cycle(&mut self, period: <Mono as Monotonic>::Duration) {
+    pub async fn cycle(&mut self, period: <Mono as Monotonic>::Duration) -> ! {
         loop {
             util::lerp(&mut self.pin, 0, MAX_PWM_POWER, STEP, period).await;
             util::lerp(&mut self.pin, MAX_PWM_POWER, 0, STEP, period).await;

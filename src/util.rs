@@ -4,7 +4,7 @@ use embedded_hal::{digital::OutputPin, pwm::SetDutyCycle};
 use hal::gpio;
 use rtic_monotonics::rp2040::prelude::*;
 
-use crate::rtic_rp2040_uart::Mono;
+use crate::kb::Mono;
 
 pub async fn blink<P: OutputPin>(
     pin: &mut P,

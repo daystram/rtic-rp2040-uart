@@ -795,6 +795,7 @@ dependencies = [
  "embedded-io 0.6.1",
  "enum-map",
  "frunk",
+ "nb 1.1.0",
  "panic-probe",
  "postcard",
  "rp2040-boot2",
