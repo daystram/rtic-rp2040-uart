@@ -4,13 +4,12 @@ use defmt::Format;
 use embedded_hal::digital::{InputPin, OutputPin};
 use rp2040_hal::gpio;
 use rtic_monotonics::rp2040::prelude::*;
-use rtic_sync::arbiter::Arbiter;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     kb::Mono,
     key::Edge,
-    transport::{self, RemoteInvoker, UartTransport},
+    transport::{self, RemoteInvoker, UartSender},
 };
 
 #[derive(Clone, Copy, Debug, Format)]
@@ -44,9 +43,9 @@ pub trait Scanner<const ROW_COUNT: usize, const COL_COUNT: usize> {
 pub trait SplitScanner<const ROW_COUNT: usize, const COL_COUNT: usize>:
     Scanner<ROW_COUNT, COL_COUNT>
 {
-    async fn scan<C>(&mut self, client: &RefCell<C>) -> Result<ROW_COUNT, COL_COUNT>
+    async fn scan<I>(&mut self, client: &RefCell<I>) -> Result<ROW_COUNT, COL_COUNT>
     where
-        C: RemoteInvoker;
+        I: RemoteInvoker;
 }
 
 // TODO: local_matrix dimension should be halved
@@ -74,9 +73,9 @@ impl<const ROW_COUNT: usize, const COL_COUNT: usize> Scanner<ROW_COUNT, COL_COUN
 impl<const ROW_COUNT: usize, const COL_COUNT: usize> SplitScanner<ROW_COUNT, COL_COUNT>
     for SplitSwitchMatrix<ROW_COUNT, COL_COUNT>
 {
-    async fn scan<C>(&mut self, client: &RefCell<C>) -> Result<ROW_COUNT, COL_COUNT>
+    async fn scan<I>(&mut self, client: &RefCell<I>) -> Result<ROW_COUNT, COL_COUNT>
     where
-        C: RemoteInvoker,
+        I: RemoteInvoker,
     {
         let _remote_result = client
             .borrow_mut()

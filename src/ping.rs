@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     kb::Mono,
-    transport::{FunctionId, Handler, RemoteInvoker},
+    transport::{FunctionId, RemoteInvoker},
 };
 
 pub struct Ping {
@@ -20,9 +20,9 @@ impl Ping {
         Ping { counter: 0 }
     }
 
-    pub async fn ping<C>(&mut self, client: &RefCell<C>)
+    pub async fn ping<I>(&mut self, client: &RefCell<I>)
     where
-        C: RemoteInvoker,
+        I: RemoteInvoker,
     {
         self.counter = self.counter.wrapping_add(1);
 
@@ -47,16 +47,6 @@ impl Ping {
             tick: Mono::now().ticks(),
         };
         postcard::to_allocvec(&res).unwrap()
-    }
-}
-
-impl Handler for Ping {
-    fn handle<'a, Q, R>(&mut self, request: Q) -> R
-    where
-        Q: serde::Deserialize<'a> + defmt::Format,
-        R: serde::Serialize + defmt::Format,
-    {
-        todo!()
     }
 }
 

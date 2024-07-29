@@ -72,7 +72,7 @@ mod kb {
             Event, EventsProcessor, InputProcessor,
         },
         rotary::RotaryEncoder,
-        transport::{RemoteExecutor, UartReceiver, UartTransport},
+        transport::{RemoteExecutor, RemoteInvoker, TransportReceiver, UartReceiver, UartSender},
     };
 
     #[derive(Clone, Copy, Debug, Format, PartialEq, PartialOrd)]
@@ -105,7 +105,7 @@ mod kb {
     struct Shared {
         is_usb_connected: bool,
         mode: Mode,
-        remote_invoker: RefCell<UartTransport>,
+        uart_sender: RefCell<UartSender>,
         usb_device: UsbDevice<'static, usb::UsbBus>,
         usb_keyboard: UsbHidClass<
             'static,
@@ -227,8 +227,9 @@ mod kb {
         )
         .unwrap();
         let (uart_reader, uart_writer) = uart_peripheral.split();
-        let remote_invoker = RefCell::new(UartTransport::new(uart_writer));
-        let (uart_receiver, sequence_number_receiver) = UartReceiver::new(uart_reader);
+        let uart_sender = RefCell::new(UartSender::new(uart_writer));
+        let mut uart_receiver = UartReceiver::new(uart_reader);
+        let seq_sender = uart_receiver.initialize_seq_sender();
 
         // Init keyboard
         // let key_matrix = Some(SplitSwitchMatrix::new(BasicVerticalSwitchMatrix::new(
@@ -246,7 +247,7 @@ mod kb {
         let ping = Some(Ping::new());
 
         // Initialize remote executor and register functions
-        let mut remote_executor = RemoteExecutor::new(sequence_number_receiver);
+        let mut remote_executor = RemoteExecutor::new(seq_sender);
         remote_executor.register_function(FUNCTION_ID_PING, Ping::ping_remote);
 
         // Begin
@@ -266,7 +267,7 @@ mod kb {
             Shared {
                 is_usb_connected: false,
                 mode: Mode::None,
-                remote_invoker,
+                uart_sender,
                 usb_device,
                 usb_keyboard,
             },
@@ -361,30 +362,30 @@ mod kb {
     // ============================= Master and Slave
 
     // ============================= Slave
-    #[task (shared=[&remote_invoker], local=[remote_executor], priority = 1)]
+    #[task (shared=[&uart_sender], local=[remote_executor], priority = 1)]
     async fn slave_server(ctx: slave_server::Context) {
         info!("slave_server()");
         ctx.local
             .remote_executor
-            .listen(ctx.shared.remote_invoker)
+            .listen(ctx.shared.uart_sender)
             .await;
     }
     // ============================= Slave
 
     // ============================= Master
-    #[task (shared=[&remote_invoker], local=[ping], priority = 1)]
+    #[task (shared=[&uart_sender], local=[ping], priority = 1)]
     async fn master_ping(ctx: master_ping::Context) {
         info!("master_ping()");
         loop {
             match ctx.local.ping {
-                Some(ping) => ping.ping(ctx.shared.remote_invoker).await,
+                Some(ping) => ping.ping(ctx.shared.uart_sender).await,
                 None => {}
             };
             Mono::delay(5.secs()).await;
         }
     }
 
-    #[task (shared=[&remote_invoker], local=[key_matrix, rotary_encoder], priority = 1)]
+    #[task (shared=[&uart_sender], local=[key_matrix, rotary_encoder], priority = 1)]
     async fn master_input_scanner(
         ctx: master_input_scanner::Context,
         mut input_sender: Sender<
@@ -399,9 +400,9 @@ mod kb {
         loop {
             let scan_start_time = Mono::now();
 
-            let remote_invoker = ctx.shared.remote_invoker;
+            let uart_sender = ctx.shared.uart_sender;
             let key_matrix_result = match ctx.local.key_matrix {
-                Some(key_matrix) => key_matrix.scan(remote_invoker).await,
+                Some(key_matrix) => key_matrix.scan(uart_sender).await,
                 None => Default::default(),
             };
             let rotary_encoder_result = match ctx.local.rotary_encoder {
