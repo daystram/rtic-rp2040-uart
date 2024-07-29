@@ -1,17 +1,17 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::{cell::RefCell, future::Future};
 use cortex_m::interrupt::Mutex;
 use defmt::{error, trace, Format};
 use embedded_io::Write;
 use hal::{
     gpio,
-    uart::{self, Reader, UartPeripheral, Writer},
+    uart::{Reader, Writer},
 };
 use rtic_monotonics::{rp2040::prelude::*, Monotonic};
 use rtic_sync::channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
-use crate::{kb::Mono, ping::PingResponse};
+use crate::kb::Mono;
 
 const UART_BUFFER_SIZE_BYTES: usize = 256;
 
@@ -74,14 +74,17 @@ impl RemoteExecutor {
                     return;
                 }
             };
+            {
+                // execute function
+                trace!("calling function");
+                let res = function(packet.payload);
+                trace!("calling function done");
 
-            // execute function
-            let res = function(packet.payload);
-
-            // return response
-            client
-                .borrow_mut()
-                .send_response(packet.seq, packet.fun, res.as_slice());
+                // return response
+                client
+                    .borrow_mut()
+                    .send_response(packet.seq, packet.fun, res.as_slice());
+            }
         }
     }
 }
@@ -128,22 +131,23 @@ impl TransportReceiver for UartReceiver {
     }
 
     fn read_into_buffer(&mut self) {
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; UART_BUFFER_SIZE_BYTES];
         if self.uart_reader.read_raw(&mut buffer).is_err() {
             return;
         }
         let packet: Packet = postcard::from_bytes(&buffer).unwrap();
-        trace!("packet: [{}]", packet);
-
-        let payload: PingResponse = postcard::from_bytes(packet.payload).unwrap();
-        trace!("packet.payload: [{}]", payload);
 
         cortex_m::interrupt::free(|cs| {
+            if let Some(ref mut old_packet) =
+                PACKET_BUFFER.borrow(cs).borrow_mut()[packet.seq as usize]
+            {
+                drop(unsafe { Box::from_raw(old_packet.payload as *const [u8] as *mut [u8]) });
+            }
             PACKET_BUFFER.borrow(cs).borrow_mut()[packet.seq as usize] = Some(Packet {
                 typ: packet.typ,
                 seq: packet.seq,
                 fun: packet.fun,
-                payload: Box::leak(packet.payload.to_vec().into_boxed_slice()),
+                payload: Box::leak(packet.payload.to_owned().into_boxed_slice()),
             });
         });
 
@@ -160,7 +164,7 @@ impl TransportReceiver for UartReceiver {
 pub trait TransportSender {
     fn send_request(&mut self, fun: FunctionId, payload: &[u8]) -> Sequence;
     fn send_response(&mut self, seq: Sequence, fun: FunctionId, payload: &[u8]);
-    fn receive_respone_poll<'a>(&mut self, seq: Sequence) -> impl Future<Output = &'a [u8]> + Send;
+    fn receive_respone_poll(&mut self, seq: Sequence) -> impl Future<Output = Vec<u8>> + Send;
 }
 
 pub struct UartSender {
@@ -237,20 +241,19 @@ impl TransportSender for UartSender {
         trace!("sending response: [{}]", payload);
     }
 
-    async fn receive_respone_poll<'a>(&mut self, seq: Sequence) -> &'a [u8] {
-        let payload = loop {
+    async fn receive_respone_poll(&mut self, seq: Sequence) -> Vec<u8> {
+        let stored_payload = loop {
             if let Some(response) = cortex_m::interrupt::free(|cs| {
-                let packet = PACKET_BUFFER.borrow(cs).borrow_mut()[seq as usize];
-                if packet.is_some() {
-                    PACKET_BUFFER.borrow(cs).borrow_mut()[seq as usize] = None;
-                }
-                packet
+                PACKET_BUFFER.borrow(cs).borrow_mut()[seq as usize].take()
             }) {
                 break response.payload;
             }
-            Mono::delay(500.micros()).await;
+            Mono::delay(100.micros()).await;
         };
-        trace!("receiving response: [{}]", payload);
+
+        let payload = stored_payload.to_owned();
+        drop(unsafe { Box::from_raw(stored_payload as *const [u8] as *mut [u8]) });
+        // trace!("receiving response: [{}]", payload);
         payload
     }
 }
@@ -268,13 +271,16 @@ impl RemoteInvoker for UartSender {
         Q: Serialize + Format,
         R: Deserialize<'b> + Format,
     {
-        let mut request_buffer = [0u8; 256];
-        let payload = postcard::to_slice(&request, &mut request_buffer).unwrap();
+        let mut request_buffer = [0u8; UART_BUFFER_SIZE_BYTES];
+        let request_payload = postcard::to_slice(&request, &mut request_buffer).unwrap();
 
-        let seq = self.send_request(fun, payload);
+        let seq = self.send_request(fun, request_payload);
 
-        let response_buffer = self.receive_respone_poll(seq).await;
-        postcard::from_bytes(response_buffer).unwrap()
+        let response_buffer = self.receive_respone_poll(seq).await.leak();
+        let response_payload = postcard::from_bytes(response_buffer).unwrap();
+        drop(unsafe { Box::from_raw(response_buffer as *const [u8] as *mut [u8]) });
+
+        response_payload
     }
 }
 

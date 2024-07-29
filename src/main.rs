@@ -33,7 +33,7 @@ mod kb {
     const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
 
     #[global_allocator]
-    static HEAP: embedded_alloc::Heap = embedded_alloc::Heap::empty();
+    pub static HEAP: embedded_alloc::Heap = embedded_alloc::Heap::empty();
     const HEAP_SIZE_BYTES: usize = 16384; // 16 KB
     static mut HEAP_MEM: [core::mem::MaybeUninit<u8>; HEAP_SIZE_BYTES] =
         [core::mem::MaybeUninit::uninit(); HEAP_SIZE_BYTES];
@@ -72,7 +72,7 @@ mod kb {
             Event, EventsProcessor, InputProcessor,
         },
         rotary::RotaryEncoder,
-        transport::{RemoteExecutor, RemoteInvoker, TransportReceiver, UartReceiver, UartSender},
+        transport::{RemoteExecutor, TransportReceiver, UartReceiver, UartSender},
     };
 
     #[derive(Clone, Copy, Debug, Format, PartialEq, PartialOrd)]
@@ -218,9 +218,10 @@ mod kb {
         )
         .enable(
             uart::UartConfig::new(
-                115_200.Hz(),
+                // 115_200.Hz(),
+                230_400.Hz(),
                 uart::DataBits::Eight,
-                Some(uart::Parity::Even),
+                None,
                 uart::StopBits::One,
             ),
             clocks.peripheral_clock.freq(),
@@ -333,13 +334,13 @@ mod kb {
 
         match mode {
             Mode::Master => {
-                heartbeat::spawn(50.millis()).ok();
+                heartbeat::spawn(20.millis()).ok();
                 master_ping::spawn().ok();
                 // master_input_scanner::spawn(input_sender).ok();
                 // master_processor::spawn(input_receiver, keys_sender, frame_sender).ok();
             }
             Mode::Slave => {
-                heartbeat::spawn(500.millis()).ok();
+                heartbeat::spawn(100.millis()).ok();
                 slave_server::spawn().ok();
             }
             _ => panic!("unsupported mode: {mode:?}"),
@@ -381,7 +382,12 @@ mod kb {
                 Some(ping) => ping.ping(ctx.shared.uart_sender).await,
                 None => {}
             };
-            Mono::delay(5.secs()).await;
+            error!(
+                "========= heap stat: free={}B used={}B",
+                HEAP.free(),
+                HEAP.used()
+            );
+            Mono::delay(1.millis()).await;
         }
     }
 

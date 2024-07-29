@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use defmt::{info, Format};
+use defmt::{info, trace, Format};
 use rtic_monotonics::{rtic_time::monotonic::TimerQueueBasedInstant, Monotonic};
 use serde::{Deserialize, Serialize};
 
@@ -32,11 +32,18 @@ impl Ping {
         };
         info!("ping(): request: [{:?}]", req);
 
+        let start_time = Mono::now();
         let res = client
             .borrow_mut()
             .invoke::<PingRequest, PingResponse>(FUNCTION_ID_PING, req)
             .await;
-        info!("ping(): response: [{:?}]", res);
+        let end_time = Mono::now();
+
+        info!(
+            "ping(): response=[{:?}] (latency={}us)",
+            res,
+            (end_time - start_time).to_micros()
+        );
     }
 
     pub fn ping_remote(req_buffer: &[u8]) -> Vec<u8> {
@@ -46,6 +53,11 @@ impl Ping {
             counter: req.counter,
             tick: Mono::now().ticks(),
         };
+        trace!(
+            "allocating: struct={}B res={}B",
+            size_of::<PingResponse>(),
+            size_of_val(&res)
+        );
         postcard::to_allocvec(&res).unwrap()
     }
 }
