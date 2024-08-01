@@ -1,8 +1,8 @@
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
-use core::{cell::RefCell, future::Future};
+use core::{any::Any, cell::RefCell, error, future::Future, mem};
 use cortex_m::interrupt::Mutex;
-use defmt::{error, trace, Format};
-use embedded_io::Write;
+use defmt::{debug, error, trace, warn, Format};
+use embedded_io::{Read, Write};
 use hal::{
     gpio,
     uart::{Reader, Writer},
@@ -11,39 +11,35 @@ use rtic_monotonics::{rp2040::prelude::*, Monotonic};
 use rtic_sync::channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
-use crate::kb::Mono;
+use crate::kb::{Mono, HEAP};
 
-const UART_BUFFER_SIZE_BYTES: usize = 256;
+const UART_FRAME_BUFFER_SIZE_BYTES: usize = 256;
+// const UART_FRAME_BUFFER_SIZE_BYTES: usize = 1 + (2 >> u8::BITS);
 
-const PACKET_QUEUE_SIZE: usize = 1;
+const REQUEST_SEQUENCE_QUEUE_SIZE: usize = 1;
 
 static PACKET_BUFFER: Mutex<RefCell<[Option<Packet>; Sequence::MAX as usize + 1]>> =
     Mutex::new(RefCell::new([None; Sequence::MAX as usize + 1]));
-static FUNCTION_REGISTRY: Mutex<RefCell<[Option<Function>; FunctionId::MAX as usize + 1]>> =
-    Mutex::new(RefCell::new([None; FunctionId::MAX as usize + 1]));
 
-type Function = fn(&[u8]) -> Vec<u8>;
+static SERVICE_REGISTRY: Mutex<RefCell<[Option<Box<dyn Service>>; ServiceId::MAX as usize + 1]>> =
+    Mutex::new(RefCell::new([const { None }; ServiceId::MAX as usize + 1]));
 
-// pub trait Function {
-//     fn handle<'a, Q, R>(&mut self, request: Q) -> R
-//     where
-//         Q: Deserialize<'a> + Format,
-//         R: Serialize + Format;
-// }
+pub trait Service: Send + Sync {
+    fn dispatch(&mut self, method_id: MethodId, request: &[u8]) -> Vec<u8>;
+}
 
 pub struct RemoteExecutor {
-    seq_receiver: Receiver<'static, Sequence, PACKET_QUEUE_SIZE>,
+    seq_receiver: Receiver<'static, Sequence, REQUEST_SEQUENCE_QUEUE_SIZE>,
 }
 
 impl RemoteExecutor {
-    pub fn new(seq_receiver: Receiver<'static, Sequence, PACKET_QUEUE_SIZE>) -> Self {
+    pub fn new(seq_receiver: Receiver<'static, Sequence, REQUEST_SEQUENCE_QUEUE_SIZE>) -> Self {
         RemoteExecutor { seq_receiver }
     }
 
-    // TODO: consider how to accept an impl method for mutable reference
-    pub fn register_function(&mut self, fun: FunctionId, function: Function) {
+    pub fn register_service(&mut self, fun: MethodId, handler: Box<dyn Service>) {
         cortex_m::interrupt::free(|cs| {
-            FUNCTION_REGISTRY.borrow(cs).borrow_mut()[fun as usize] = Some(function);
+            SERVICE_REGISTRY.borrow(cs).borrow_mut()[fun as usize] = Some(handler);
         });
     }
 
@@ -56,41 +52,54 @@ impl RemoteExecutor {
             let packet = match cortex_m::interrupt::free(|cs| {
                 PACKET_BUFFER.borrow(cs).borrow()[seq as usize]
             }) {
-                Some(packet) => packet,
+                Some(packet) => {
+                    // TODO: dropping here allows the freeing of heap early, but this somehow break packet.payload
+                    // warn!(
+                    //     "dropping on listen: size={}B",
+                    //     mem::size_of_val(packet.payload)
+                    // );
+                    // drop(unsafe { Box::from_raw(packet.payload as *const [u8] as *mut [u8]) });
+                    packet
+                }
                 None => {
                     error!("packet not found in buffer: seq={}", seq);
                     return;
                 }
             };
-            let function = match cortex_m::interrupt::free(|cs| {
-                FUNCTION_REGISTRY.borrow(cs).borrow()[packet.fun as usize]
-            }) {
-                Some(function) => function,
-                None => {
-                    error!(
-                        "function handler not registered: seq={} fun={}",
-                        packet.seq, packet.fun
-                    );
-                    return;
-                }
-            };
-            {
-                // execute function
-                trace!("calling function");
-                let res = function(packet.payload);
-                trace!("calling function done");
+            warn!("packet.payload: {}", packet.payload);
 
-                // return response
-                client
-                    .borrow_mut()
-                    .send_response(packet.seq, packet.fun, res.as_slice());
-            }
+            // execute function
+            let res = cortex_m::interrupt::free(|cs| {
+                if let Some(ref mut service) =
+                    SERVICE_REGISTRY.borrow(cs).borrow_mut()[packet.service_id as usize]
+                {
+                    service.dispatch(packet.method_id, packet.payload)
+                } else {
+                    error!("service not implemented: service_id={}", packet.service_id);
+                    Vec::new()
+                }
+            });
+
+            // return response
+            client.borrow_mut().send_response(
+                packet.sequence,
+                packet.service_id,
+                packet.method_id,
+                res.as_slice(),
+            );
+
+            // error!(
+            //     "========= heap stat: free={}B used={}B",
+            //     HEAP.free(),
+            //     HEAP.used()
+            // );
         }
     }
 }
 
 pub trait TransportReceiver {
-    fn initialize_seq_sender(&mut self) -> Receiver<'static, Sequence, PACKET_QUEUE_SIZE>;
+    fn initialize_seq_sender(&mut self)
+        -> Receiver<'static, Sequence, REQUEST_SEQUENCE_QUEUE_SIZE>;
     fn read_into_buffer(&mut self);
 }
 
@@ -102,7 +111,7 @@ pub struct UartReceiver {
             gpio::Pin<gpio::bank0::Gpio1, gpio::FunctionUart, gpio::PullDown>,
         ),
     >,
-    seq_sender: Option<Sender<'static, Sequence, PACKET_QUEUE_SIZE>>,
+    seq_sender: Option<Sender<'static, Sequence, REQUEST_SEQUENCE_QUEUE_SIZE>>,
 }
 
 impl UartReceiver {
@@ -124,37 +133,85 @@ impl UartReceiver {
 }
 
 impl TransportReceiver for UartReceiver {
-    fn initialize_seq_sender(&mut self) -> Receiver<'static, Sequence, PACKET_QUEUE_SIZE> {
-        let (seq_sender, seq_receiver) = rtic_sync::make_channel!(Sequence, PACKET_QUEUE_SIZE);
+    fn initialize_seq_sender(
+        &mut self,
+    ) -> Receiver<'static, Sequence, REQUEST_SEQUENCE_QUEUE_SIZE> {
+        let (seq_sender, seq_receiver) =
+            rtic_sync::make_channel!(Sequence, REQUEST_SEQUENCE_QUEUE_SIZE);
         self.seq_sender = Some(seq_sender);
         seq_receiver
     }
 
     fn read_into_buffer(&mut self) {
-        let mut buffer = [0u8; UART_BUFFER_SIZE_BYTES];
-        if self.uart_reader.read_raw(&mut buffer).is_err() {
+        let mut buffer = [0u8; UART_FRAME_BUFFER_SIZE_BYTES];
+        let mut offset = 0;
+
+        match self.uart_reader.read_raw(&mut buffer[offset..]) {
+            Ok(n) => {
+                offset += n;
+            }
+            Err(_) => return, // fails on first read, drop
+        }
+
+        let expected_length = buffer[0] as usize;
+        if expected_length == 0 {
             return;
         }
-        let packet: Packet = postcard::from_bytes(&buffer).unwrap();
+        if expected_length > buffer.len() {
+            error!(
+                "expected packet overflows buffer: expected_len={}",
+                expected_length
+            )
+        }
 
+        while offset < expected_length {
+            match self.uart_reader.read_raw(&mut buffer[offset..]) {
+                Ok(n) => {
+                    offset += n;
+                }
+                Err(nb::Error::WouldBlock) => continue,
+                Err(_) => return, // unhandled
+            }
+        }
+        if offset == 0 {
+            return;
+        }
+        let packet: Packet =
+            postcard::from_bytes_cobs(&mut buffer[1..expected_length + 1]).unwrap();
+
+        error!(
+            "========= 1 heap stat: free={}B used={}B",
+            HEAP.free(),
+            HEAP.used()
+        );
         cortex_m::interrupt::free(|cs| {
             if let Some(ref mut old_packet) =
-                PACKET_BUFFER.borrow(cs).borrow_mut()[packet.seq as usize]
+                PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize]
             {
+                warn!("dropping on wrap: size={}B", mem::size_of_val(old_packet));
                 drop(unsafe { Box::from_raw(old_packet.payload as *const [u8] as *mut [u8]) });
             }
-            PACKET_BUFFER.borrow(cs).borrow_mut()[packet.seq as usize] = Some(Packet {
-                typ: packet.typ,
-                seq: packet.seq,
-                fun: packet.fun,
+            PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize] = Some(Packet {
+                kind: packet.kind,
+                sequence: packet.sequence,
+                service_id: packet.service_id,
+                method_id: packet.method_id,
                 payload: Box::leak(packet.payload.to_owned().into_boxed_slice()),
             });
         });
+        error!(
+            "========= 2 heap stat: free={}B used={}B",
+            HEAP.free(),
+            HEAP.used()
+        );
 
-        if packet.typ == Type::Request {
+        if packet.kind == Kind::Request {
             if let Some(ref mut seq_sender) = self.seq_sender {
-                if seq_sender.try_send(packet.seq).is_err() {
-                    error!("request queue is full, request dropped: seq={}", packet.seq);
+                if seq_sender.try_send(packet.sequence).is_err() {
+                    error!(
+                        "request sequence queue is full, request dropped: seq={}",
+                        packet.sequence
+                    );
                 };
             }
         }
@@ -162,9 +219,21 @@ impl TransportReceiver for UartReceiver {
 }
 
 pub trait TransportSender {
-    fn send_request(&mut self, fun: FunctionId, payload: &[u8]) -> Sequence;
-    fn send_response(&mut self, seq: Sequence, fun: FunctionId, payload: &[u8]);
-    fn receive_respone_poll(&mut self, seq: Sequence) -> impl Future<Output = Vec<u8>> + Send;
+    fn send_request(
+        &mut self,
+        service_id: ServiceId,
+        method_id: MethodId,
+        payload: &[u8],
+    ) -> Sequence;
+    fn send_response(
+        &mut self,
+        sequence: Sequence,
+        service_id: ServiceId,
+        method_id: MethodId,
+        payload: &[u8],
+    );
+    fn receive_response_poll(&mut self, sequence: Sequence)
+        -> impl Future<Output = Vec<u8>> + Send;
 }
 
 pub struct UartSender {
@@ -191,57 +260,65 @@ impl UartSender {
         UartSender { uart_writer }
     }
 
-    fn get_seq() -> Sequence {
-        static mut SEQ: Sequence = 0;
+    fn get_next_sequence() -> Sequence {
+        static mut SEQUENCE: Sequence = 0;
         unsafe {
-            SEQ = SEQ.wrapping_add(1);
-            SEQ
+            SEQUENCE = SEQUENCE.wrapping_add(1);
+            SEQUENCE
         }
     }
 }
 
 impl TransportSender for UartSender {
-    fn send_request(&mut self, fun: FunctionId, payload: &[u8]) -> Sequence {
-        let seq = Self::get_seq();
-        let mut buffer = [0u8; UART_BUFFER_SIZE_BYTES];
-        self.uart_writer
-            .write(
-                postcard::to_slice(
-                    &Packet {
-                        typ: Type::Request,
-                        seq,
-                        fun,
-                        payload,
-                    },
-                    &mut buffer,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        trace!("sending request: [{}]", payload);
-        seq
+    fn send_request(
+        &mut self,
+        service_id: ServiceId,
+        method_id: MethodId,
+        payload: &[u8],
+    ) -> Sequence {
+        let sequence = Self::get_next_sequence();
+
+        let packet = postcard::to_allocvec_cobs(&Packet {
+            kind: Kind::Request,
+            sequence,
+            service_id,
+            method_id,
+            payload,
+        })
+        .unwrap();
+
+        let mut buffer = Vec::with_capacity(packet.len() + 1);
+        buffer.push(packet.len() as u8);
+        buffer.extend_from_slice(&packet);
+
+        self.uart_writer.write_all(&buffer).unwrap();
+        sequence
     }
 
-    fn send_response(&mut self, seq: Sequence, fun: FunctionId, payload: &[u8]) {
-        let mut buffer = [0u8; UART_BUFFER_SIZE_BYTES];
-        self.uart_writer
-            .write(
-                postcard::to_slice(
-                    &Packet {
-                        typ: Type::Response,
-                        seq,
-                        fun,
-                        payload,
-                    },
-                    &mut buffer,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        trace!("sending response: [{}]", payload);
+    fn send_response(
+        &mut self,
+        sequence: Sequence,
+        service_id: ServiceId,
+        method_id: MethodId,
+        payload: &[u8],
+    ) {
+        let packet = postcard::to_allocvec_cobs(&Packet {
+            kind: Kind::Response,
+            sequence,
+            service_id,
+            method_id,
+            payload,
+        })
+        .unwrap();
+
+        let mut buffer = Vec::with_capacity(packet.len() + 1);
+        buffer.push(packet.len() as u8);
+        buffer.extend_from_slice(&packet);
+
+        self.uart_writer.write_all(&buffer).unwrap();
     }
 
-    async fn receive_respone_poll(&mut self, seq: Sequence) -> Vec<u8> {
+    async fn receive_response_poll(&mut self, seq: Sequence) -> Vec<u8> {
         let stored_payload = loop {
             if let Some(response) = cortex_m::interrupt::free(|cs| {
                 PACKET_BUFFER.borrow(cs).borrow_mut()[seq as usize].take()
@@ -253,30 +330,39 @@ impl TransportSender for UartSender {
 
         let payload = stored_payload.to_owned();
         drop(unsafe { Box::from_raw(stored_payload as *const [u8] as *mut [u8]) });
-        // trace!("receiving response: [{}]", payload);
         payload
     }
 }
 
 pub trait RemoteInvoker {
-    async fn invoke<'b, Q, R>(&mut self, fun: u8, request: Q) -> R
+    async fn invoke<'b, Q, R>(
+        &mut self,
+        service_id: ServiceId,
+        method_id: MethodId,
+        request: Q,
+    ) -> R
     where
-        Q: Serialize + Format,
-        R: Deserialize<'b> + Format;
+        Q: Serialize,
+        R: Deserialize<'b>;
 }
 
 impl RemoteInvoker for UartSender {
-    async fn invoke<'b, Q, R>(&mut self, fun: u8, request: Q) -> R
+    async fn invoke<'b, Q, R>(
+        &mut self,
+        service_id: ServiceId,
+        method_id: MethodId,
+        request: Q,
+    ) -> R
     where
-        Q: Serialize + Format,
-        R: Deserialize<'b> + Format,
+        Q: Serialize,
+        R: Deserialize<'b>,
     {
-        let mut request_buffer = [0u8; UART_BUFFER_SIZE_BYTES];
+        let mut request_buffer = [0u8; UART_FRAME_BUFFER_SIZE_BYTES];
         let request_payload = postcard::to_slice(&request, &mut request_buffer).unwrap();
 
-        let seq = self.send_request(fun, request_payload);
+        let seq = self.send_request(service_id, method_id, request_payload);
 
-        let response_buffer = self.receive_respone_poll(seq).await.leak();
+        let response_buffer = self.receive_response_poll(seq).await.leak();
         let response_payload = postcard::from_bytes(response_buffer).unwrap();
         drop(unsafe { Box::from_raw(response_buffer as *const [u8] as *mut [u8]) });
 
@@ -285,17 +371,41 @@ impl RemoteInvoker for UartSender {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Format, PartialEq, Serialize)]
-pub enum Type {
+#[repr(u8)]
+pub enum Kind {
     Request,
     Response,
 }
-pub type FunctionId = u8;
+
 pub type Sequence = u8;
+pub type ServiceId = u8;
+pub type MethodId = u8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
 pub struct Packet<'a> {
-    typ: Type,
-    seq: Sequence,
-    fun: FunctionId,
+    kind: Kind,
+    sequence: Sequence,
+    service_id: ServiceId,
+    method_id: MethodId,
     payload: &'a [u8],
 }
+
+/*
+    Packet
+         0   1   2   3   4   5   6   7
+       +---+---+---+---+---+---+---+---+
+    0  |            length             |
+       +---+---+---+---+---+---+---+---+
+    8  |             kind              |
+       +---+---+---+---+---+---+---+---+
+   16  |           sequence            |
+       +---+---+---+---+---+---+---+---+
+   32  |   service_id  |   method_id   |
+       +---+---+---+---+---+---+---+---+
+   64  |                               |
+    .  |                               |
+    .  |           payload             |
+    .  |                               |
+    N  |                               |
+       +---+---+---+---+---+---+---+---+
+*/

@@ -40,7 +40,7 @@ mod kb {
 
     use alloc::{boxed::Box, vec::Vec};
     use core::cell::RefCell;
-    use defmt::{debug, error, info, warn, Format};
+    use defmt::{debug, error, info, trace, warn, Format};
     use hal::{
         clocks::{init_clocks_and_plls, Clock},
         fugit::RateExtU32,
@@ -64,7 +64,7 @@ mod kb {
         key::{Action, Edge, Key},
         keyboard,
         matrix::{BasicVerticalSwitchMatrix, SplitScanner, SplitSwitchMatrix},
-        ping::{Ping, FUNCTION_ID_PING},
+        ping::{Ping, SERVICE_ID_PING},
         processor::{
             events::rgb::FrameIterator,
             input::debounce::KeyMatrixRisingFallingDebounceProcessor,
@@ -211,7 +211,7 @@ mod kb {
             .build();
 
         // Init transport and remote invoker
-        let uart_peripheral = uart::UartPeripheral::new(
+        let mut uart_peripheral = uart::UartPeripheral::new(
             ctx.device.UART0,
             (pins.gpio0.into_function(), pins.gpio1.into_function()),
             &mut ctx.device.RESETS,
@@ -227,6 +227,7 @@ mod kb {
             clocks.peripheral_clock.freq(),
         )
         .unwrap();
+        uart_peripheral.set_fifos(true);
         let (uart_reader, uart_writer) = uart_peripheral.split();
         let uart_sender = RefCell::new(UartSender::new(uart_writer));
         let mut uart_receiver = UartReceiver::new(uart_reader);
@@ -247,9 +248,9 @@ mod kb {
         let rotary_encoder = None;
         let ping = Some(Ping::new());
 
-        // Initialize remote executor and register functions
+        // Initialize remote executor and register services
         let mut remote_executor = RemoteExecutor::new(seq_sender);
-        remote_executor.register_function(FUNCTION_ID_PING, Ping::ping_remote);
+        remote_executor.register_service(SERVICE_ID_PING, Box::new(Ping::new()));
 
         // Begin
         start_wait_usb::spawn(
@@ -356,9 +357,9 @@ mod kb {
 
     #[task(binds = UART0_IRQ, local = [uart_receiver], priority = 1)]
     fn receive_uart(ctx: receive_uart::Context) {
-        warn!("UART0_IRQ start");
+        // warn!("UART0_IRQ start");
         ctx.local.uart_receiver.read_into_buffer();
-        warn!("UART0_IRQ done");
+        // warn!("UART0_IRQ done");
     }
     // ============================= Master and Slave
 
@@ -377,9 +378,18 @@ mod kb {
     #[task (shared=[&uart_sender], local=[ping], priority = 1)]
     async fn master_ping(ctx: master_ping::Context) {
         info!("master_ping()");
+        let mut counter = 0u8;
         loop {
+            counter = (counter + 1) % 10;
+            trace!("{}", counter);
             match ctx.local.ping {
-                Some(ping) => ping.ping(ctx.shared.uart_sender).await,
+                Some(ping) => {
+                    if counter < 5 {
+                        ping.ping_a(ctx.shared.uart_sender).await
+                    } else {
+                        ping.ping_b(ctx.shared.uart_sender).await
+                    }
+                }
                 None => {}
             };
             error!(
@@ -387,7 +397,7 @@ mod kb {
                 HEAP.free(),
                 HEAP.used()
             );
-            Mono::delay(1.millis()).await;
+            Mono::delay(500.millis()).await;
         }
     }
 

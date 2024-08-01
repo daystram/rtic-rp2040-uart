@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     kb::Mono,
     key::Edge,
-    transport::{self, RemoteInvoker, UartSender},
+    transport::{self, RemoteInvoker, ServiceId, UartSender},
 };
 
 #[derive(Clone, Copy, Debug, Format)]
@@ -60,7 +60,8 @@ impl<'a, const ROW_COUNT: usize, const COL_COUNT: usize> SplitSwitchMatrix<ROW_C
     }
 }
 
-const FUNCTION_ID_KEY_MATRIX_SCAN: transport::FunctionId = 0x11;
+pub const SERVICE_ID_KEY_MATRIX: ServiceId = 0x10;
+const FUNCTION_ID_KEY_MATRIX_SCAN: transport::MethodId = 0x11;
 
 impl<const ROW_COUNT: usize, const COL_COUNT: usize> Scanner<ROW_COUNT, COL_COUNT>
     for SplitSwitchMatrix<ROW_COUNT, COL_COUNT>
@@ -80,6 +81,7 @@ impl<const ROW_COUNT: usize, const COL_COUNT: usize> SplitScanner<ROW_COUNT, COL
         let _remote_result = client
             .borrow_mut()
             .invoke::<SwitchMatrixScanRequest, SwitchMatrixScanResponse>(
+                SERVICE_ID_KEY_MATRIX,
                 FUNCTION_ID_KEY_MATRIX_SCAN,
                 SwitchMatrixScanRequest {},
             )
