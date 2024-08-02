@@ -73,6 +73,7 @@ mod kb {
         },
         rotary::RotaryEncoder,
         transport::{RemoteExecutor, TransportReceiver, UartReceiver, UartSender},
+        util,
     };
 
     #[derive(Clone, Copy, Debug, Format, PartialEq, PartialOrd)]
@@ -221,7 +222,7 @@ mod kb {
                 // 115_200.Hz(),
                 230_400.Hz(),
                 uart::DataBits::Eight,
-                None,
+                Some(uart::Parity::Even),
                 uart::StopBits::One,
             ),
             clocks.peripheral_clock.freq(),
@@ -358,7 +359,15 @@ mod kb {
     #[task(binds = UART0_IRQ, local = [uart_receiver], priority = 1)]
     fn receive_uart(ctx: receive_uart::Context) {
         // warn!("UART0_IRQ start");
+
+        let start_time = Mono::now();
         ctx.local.uart_receiver.read_into_buffer();
+        let end_time = Mono::now();
+        util::log_duration(
+            util::LogDurationTag::UARTIRQRecieveBuffer,
+            start_time,
+            end_time,
+        );
         // warn!("UART0_IRQ done");
     }
     // ============================= Master and Slave
@@ -380,24 +389,22 @@ mod kb {
         info!("master_ping()");
         let mut counter = 0u8;
         loop {
-            counter = (counter + 1) % 10;
-            trace!("{}", counter);
+            // counter = (counter + 1) % 10;
             match ctx.local.ping {
                 Some(ping) => {
+                    let start_time = Mono::now();
                     if counter < 5 {
                         ping.ping_a(ctx.shared.uart_sender).await
                     } else {
                         ping.ping_b(ctx.shared.uart_sender).await
                     }
+                    let end_time = Mono::now();
+                    util::log_duration(util::LogDurationTag::ClientLatency, start_time, end_time);
                 }
                 None => {}
             };
-            error!(
-                "========= heap stat: free={}B used={}B",
-                HEAP.free(),
-                HEAP.used()
-            );
-            Mono::delay(500.millis()).await;
+            util::log_heap();
+            Mono::delay(1.millis()).await;
         }
     }
 

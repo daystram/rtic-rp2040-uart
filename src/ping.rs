@@ -32,23 +32,17 @@ impl Ping {
             counter: self.counter,
             tick: Mono::now().ticks(),
         };
-        info!("ping_a(): request: [{:?}]", req);
+        // info!("ping_a(): request: [{:?}]", req);
 
-        let start_time = Mono::now();
         let res = client
             .borrow_mut()
             .invoke::<PingARequest, PingAResponse>(SERVICE_ID_PING, METHOD_ID_PING_A, req)
             .await;
-        let end_time = Mono::now();
-        info!(
-            "ping_a(): response=[{:?}] (latency={}us)",
-            res,
-            (end_time - start_time).to_micros(),
-        );
+        // info!("ping_a(): response=[{:?}]", res,);
     }
 
     fn service_ping_a(&mut self, request: PingARequest) -> PingAResponse {
-        info!("service_ping_a()");
+        // info!("service_ping_a()");
         PingAResponse {
             counter: request.counter + 10,
             tick: Mono::now().ticks(),
@@ -66,23 +60,17 @@ impl Ping {
             counter: self.counter,
             tick: Mono::now().ticks(),
         };
-        info!("ping_b(): request: [{:?}]", req);
+        // info!("ping_b(): request: [{:?}]", req);
 
-        let start_time = Mono::now();
         let res = client
             .borrow_mut()
             .invoke::<PingBRequest, PingBResponse>(SERVICE_ID_PING, METHOD_ID_PING_B, req)
             .await;
-        let end_time = Mono::now();
-        info!(
-            "ping_b(): response=[{:?}] (latency={}us)",
-            res,
-            (end_time - start_time).to_micros(),
-        );
+        // info!("ping_b(): response=[{:?}]", res,);
     }
 
     fn service_ping_b(&mut self, request: PingBRequest) -> PingBResponse {
-        info!("service_ping_b()");
+        // info!("service_ping_b()");
         PingBResponse {
             text: format!("bye, {}", request.text),
             counter: request.counter + 100,

@@ -11,7 +11,10 @@ use rtic_monotonics::{rp2040::prelude::*, Monotonic};
 use rtic_sync::channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
-use crate::kb::{Mono, HEAP};
+use crate::{
+    kb::{Mono, HEAP},
+    util::{self, log_heap},
+};
 
 const UART_FRAME_BUFFER_SIZE_BYTES: usize = 256;
 // const UART_FRAME_BUFFER_SIZE_BYTES: usize = 1 + (2 >> u8::BITS);
@@ -48,6 +51,8 @@ impl RemoteExecutor {
         S: TransportSender,
     {
         while let Ok(seq) = self.seq_receiver.recv().await {
+            let start_time = Mono::now();
+
             // parse request payload
             let packet = match cortex_m::interrupt::free(|cs| {
                 PACKET_BUFFER.borrow(cs).borrow()[seq as usize]
@@ -66,7 +71,6 @@ impl RemoteExecutor {
                     return;
                 }
             };
-            warn!("packet.payload: {}", packet.payload);
 
             // execute function
             let res = cortex_m::interrupt::free(|cs| {
@@ -88,11 +92,10 @@ impl RemoteExecutor {
                 res.as_slice(),
             );
 
-            // error!(
-            //     "========= heap stat: free={}B used={}B",
-            //     HEAP.free(),
-            //     HEAP.used()
-            // );
+            let end_time = Mono::now();
+            util::log_duration(util::LogDurationTag::ServerLatency, start_time, end_time);
+
+            util::log_heap();
         }
     }
 }
@@ -179,16 +182,11 @@ impl TransportReceiver for UartReceiver {
         let packet: Packet =
             postcard::from_bytes_cobs(&mut buffer[1..expected_length + 1]).unwrap();
 
-        error!(
-            "========= 1 heap stat: free={}B used={}B",
-            HEAP.free(),
-            HEAP.used()
-        );
         cortex_m::interrupt::free(|cs| {
             if let Some(ref mut old_packet) =
                 PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize]
             {
-                warn!("dropping on wrap: size={}B", mem::size_of_val(old_packet));
+                // warn!("dropping on wrap: size={}B", mem::size_of_val(old_packet));
                 drop(unsafe { Box::from_raw(old_packet.payload as *const [u8] as *mut [u8]) });
             }
             PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize] = Some(Packet {
@@ -199,11 +197,6 @@ impl TransportReceiver for UartReceiver {
                 payload: Box::leak(packet.payload.to_owned().into_boxed_slice()),
             });
         });
-        error!(
-            "========= 2 heap stat: free={}B used={}B",
-            HEAP.free(),
-            HEAP.used()
-        );
 
         if packet.kind == Kind::Request {
             if let Some(ref mut seq_sender) = self.seq_sender {
@@ -325,7 +318,7 @@ impl TransportSender for UartSender {
             }) {
                 break response.payload;
             }
-            Mono::delay(100.micros()).await;
+            Mono::delay(50.micros()).await;
         };
 
         let payload = stored_payload.to_owned();
