@@ -1,15 +1,12 @@
 pub mod uart;
 
-use core::{cell::RefCell, future::Future};
-
 use alloc::vec::Vec;
-use cortex_m::interrupt::Mutex;
+use core::future::Future;
 use defmt::Format;
 use rtic_sync::channel::Receiver;
 use serde::{Deserialize, Serialize};
 
-pub static PACKET_BUFFER: Mutex<RefCell<[Option<Packet>; Sequence::MAX as usize + 1]>> =
-    Mutex::new(RefCell::new([None; Sequence::MAX as usize + 1]));
+use super::{MethodId, ServiceId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Format, PartialEq, Serialize)]
 #[repr(u8)]
@@ -22,7 +19,7 @@ pub type Sequence = u8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Format, Serialize)]
 pub struct Packet<'a> {
-    pub kind: Kind,
+    kind: Kind,
     pub sequence: Sequence,
     pub service_id: super::ServiceId,
     pub method_id: super::MethodId,
@@ -63,13 +60,15 @@ pub trait TransportSender {
         method_id: super::MethodId,
         payload: &[u8],
     ) -> Sequence;
-    fn send_response(
+    fn get_payload(
         &mut self,
         sequence: Sequence,
-        service_id: super::ServiceId,
-        method_id: super::MethodId,
-        payload: &[u8],
-    );
+    ) -> Result<(ServiceId, MethodId, &[u8], impl FnMut(&[u8])), Error>;
     fn receive_response_poll(&mut self, sequence: Sequence)
         -> impl Future<Output = Vec<u8>> + Send;
+}
+
+#[derive(Clone, Copy, Debug, Format, PartialEq)]
+pub enum Error {
+    MissingPacketBuffer,
 }

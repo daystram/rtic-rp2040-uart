@@ -1,4 +1,7 @@
+use core::cell::RefCell;
+
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
+use cortex_m::interrupt::Mutex;
 use embedded_io::Write;
 use hal::{
     gpio,
@@ -16,6 +19,9 @@ use crate::{
 use super::{Kind, Packet, TransportReceiver, TransportSender};
 
 const UART_FRAME_BUFFER_SIZE_BYTES: usize = 256;
+
+static PACKET_BUFFER: Mutex<RefCell<[Option<Packet>; Sequence::MAX as usize + 1]>> =
+    Mutex::new(RefCell::new([None; Sequence::MAX as usize + 1]));
 
 pub struct UartReceiver {
     uart_reader: Reader<
@@ -95,12 +101,12 @@ impl TransportReceiver for UartReceiver {
 
         cortex_m::interrupt::free(|cs| {
             if let Some(ref mut old_packet) =
-                super::PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize]
+                PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize]
             {
                 // warn!("dropping on wrap: size={}B", mem::size_of_val(old_packet));
                 drop(unsafe { Box::from_raw(old_packet.payload as *const [u8] as *mut [u8]) });
             }
-            super::PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize] = Some(Packet {
+            PACKET_BUFFER.borrow(cs).borrow_mut()[packet.sequence as usize] = Some(Packet {
                 kind: packet.kind,
                 sequence: packet.sequence,
                 service_id: packet.service_id,
@@ -153,6 +159,32 @@ impl UartSender {
             SEQUENCE
         }
     }
+
+    fn send(&mut self, packet: &Packet) {
+        let packet = postcard::to_allocvec_cobs(packet).unwrap();
+
+        let mut buffer = Vec::with_capacity(packet.len() + 1);
+        buffer.push(packet.len() as u8);
+        buffer.extend_from_slice(&packet);
+
+        self.uart_writer.write_all(&buffer).unwrap();
+    }
+
+    fn send_response(
+        &mut self,
+        sequence: Sequence,
+        service_id: ServiceId,
+        method_id: MethodId,
+        payload: &[u8],
+    ) {
+        self.send(&Packet {
+            kind: Kind::Response,
+            sequence,
+            service_id,
+            method_id,
+            payload,
+        })
+    }
 }
 
 impl TransportSender for UartSender {
@@ -163,51 +195,52 @@ impl TransportSender for UartSender {
         payload: &[u8],
     ) -> Sequence {
         let sequence = Self::get_next_sequence();
-
-        let packet = postcard::to_allocvec_cobs(&Packet {
+        self.send(&Packet {
             kind: Kind::Request,
             sequence,
             service_id,
             method_id,
             payload,
-        })
-        .unwrap();
-
-        let mut buffer = Vec::with_capacity(packet.len() + 1);
-        buffer.push(packet.len() as u8);
-        buffer.extend_from_slice(&packet);
-
-        self.uart_writer.write_all(&buffer).unwrap();
+        });
         sequence
     }
 
-    fn send_response(
+    fn get_payload(
         &mut self,
         sequence: Sequence,
-        service_id: ServiceId,
-        method_id: MethodId,
-        payload: &[u8],
-    ) {
-        let packet = postcard::to_allocvec_cobs(&Packet {
-            kind: Kind::Response,
-            sequence,
-            service_id,
-            method_id,
-            payload,
-        })
-        .unwrap();
+    ) -> Result<(ServiceId, MethodId, &[u8], impl FnMut(&[u8])), super::Error> {
+        let packet = match cortex_m::interrupt::free(|cs| {
+            PACKET_BUFFER.borrow(cs).borrow()[sequence as usize]
+        }) {
+            Some(packet) => {
+                // TODO: dropping here allows the freeing of heap early, but this somehow break packet.payload
+                // warn!(
+                //     "dropping on listen: size={}B",
+                //     mem::size_of_val(packet.payload)
+                // );
+                // drop(unsafe { Box::from_raw(packet.payload as *const [u8] as *mut [u8]) });
+                packet
+            }
+            None => {
+                defmt::error!("packet not found in buffer: seq={}", sequence);
+                return Result::Err(super::Error::MissingPacketBuffer);
+            }
+        };
 
-        let mut buffer = Vec::with_capacity(packet.len() + 1);
-        buffer.push(packet.len() as u8);
-        buffer.extend_from_slice(&packet);
-
-        self.uart_writer.write_all(&buffer).unwrap();
+        Result::Ok((
+            packet.service_id,
+            packet.method_id,
+            packet.payload,
+            move |res: &[u8]| {
+                self.send_response(sequence, packet.service_id, packet.method_id, res)
+            },
+        ))
     }
 
     async fn receive_response_poll(&mut self, seq: Sequence) -> Vec<u8> {
         let stored_payload = loop {
             if let Some(response) = cortex_m::interrupt::free(|cs| {
-                super::PACKET_BUFFER.borrow(cs).borrow_mut()[seq as usize].take()
+                PACKET_BUFFER.borrow(cs).borrow_mut()[seq as usize].take()
             }) {
                 break response.payload;
             }

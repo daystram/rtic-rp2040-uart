@@ -64,7 +64,7 @@ mod kb {
         key::{Action, Edge, Key},
         keyboard,
         matrix::{BasicVerticalSwitchMatrix, SplitScanner, SplitSwitchMatrix},
-        ping::{Ping, SERVICE_ID_PING},
+        ping::Ping,
         processor::{
             events::rgb::FrameIterator,
             input::debounce::KeyMatrixRisingFallingDebounceProcessor,
@@ -72,9 +72,10 @@ mod kb {
             Event, EventsProcessor, InputProcessor,
         },
         remote::{
+            self,
             transport::{
                 uart::{UartReceiver, UartSender},
-                TransportReceiver,
+                Sequence, TransportReceiver,
             },
             Executor,
         },
@@ -123,7 +124,6 @@ mod kb {
 
     #[local]
     struct Local {
-        ping: Option<Ping>,
         key_matrix: Option<
             SplitSwitchMatrix<
                 { keyboard::KEY_MATRIX_ROW_COUNT },
@@ -132,7 +132,6 @@ mod kb {
         >,
         rotary_encoder: Option<RotaryEncoder>,
         heartbeat_led: HeartbeatLED,
-        remote_executor: Executor,
         uart_receiver: UartReceiver,
     }
 
@@ -255,10 +254,6 @@ mod kb {
         let rotary_encoder = None;
         let ping = Some(Ping::new());
 
-        // Initialize remote executor and register services
-        let mut remote_executor = Executor::new(seq_sender);
-        remote_executor.register_service(SERVICE_ID_PING, Box::new(Ping::new()));
-
         // Begin
         start_wait_usb::spawn(
             1.secs(),
@@ -268,6 +263,8 @@ mod kb {
             keys_receiver,
             frame_sender,
             frame_receiver,
+            seq_sender,
+            ping,
         )
         .ok();
 
@@ -281,11 +278,9 @@ mod kb {
                 usb_keyboard,
             },
             Local {
-                ping,
                 key_matrix,
                 rotary_encoder,
                 heartbeat_led,
-                remote_executor,
                 uart_receiver,
             },
         )
@@ -319,6 +314,8 @@ mod kb {
         keys_receiver: Receiver<'static, Vec<Key>, KEYS_CHANNEL_BUFFER_SIZE>,
         frame_sender: Sender<'static, Box<dyn FrameIterator>, 1>,
         _frame_receiver: Receiver<'static, Box<dyn FrameIterator>, 1>,
+        seq_sender: Receiver<'static, Sequence, { remote::REQUEST_SEQUENCE_QUEUE_SIZE }>,
+        ping: Option<Ping>,
     ) {
         info!("start_wait_usb()");
 
@@ -343,13 +340,21 @@ mod kb {
         match mode {
             Mode::Master => {
                 heartbeat::spawn(20.millis()).ok();
-                master_ping::spawn().ok();
+                if let Some(ping) = ping {
+                    master_ping::spawn(ping).ok();
+                }
                 // master_input_scanner::spawn(input_sender).ok();
                 // master_processor::spawn(input_receiver, keys_sender, frame_sender).ok();
             }
             Mode::Slave => {
+                // Initialize remote executor and register services
+                let mut remote_executor = Executor::new(seq_sender);
+                if let Some(ping) = ping {
+                    remote_executor.register_service(Box::new(ping));
+                }
+
                 heartbeat::spawn(100.millis()).ok();
-                slave_server::spawn().ok();
+                slave_server::spawn(remote_executor).ok();
             }
             _ => panic!("unsupported mode: {mode:?}"),
         }
@@ -379,36 +384,29 @@ mod kb {
     // ============================= Master and Slave
 
     // ============================= Slave
-    #[task (shared=[&uart_sender], local=[remote_executor], priority = 1)]
-    async fn slave_server(ctx: slave_server::Context) {
+    #[task (shared=[&uart_sender], priority = 1)]
+    async fn slave_server(ctx: slave_server::Context, mut remote_executor: Executor) {
         info!("slave_server()");
-        ctx.local
-            .remote_executor
-            .listen(ctx.shared.uart_sender)
-            .await;
+        remote_executor.listen(ctx.shared.uart_sender).await;
     }
     // ============================= Slave
 
     // ============================= Master
-    #[task (shared=[&uart_sender], local=[ping], priority = 1)]
-    async fn master_ping(ctx: master_ping::Context) {
+    #[task (shared=[&uart_sender], priority = 1)]
+    async fn master_ping(ctx: master_ping::Context, mut ping: Ping) {
         info!("master_ping()");
         let mut counter = 0u8;
         loop {
             // counter = (counter + 1) % 10;
-            match ctx.local.ping {
-                Some(ping) => {
-                    let start_time = Mono::now();
-                    if counter < 5 {
-                        ping.ping_a(ctx.shared.uart_sender).await
-                    } else {
-                        ping.ping_b(ctx.shared.uart_sender).await
-                    }
-                    let end_time = Mono::now();
-                    util::log_duration(util::LogDurationTag::ClientLatency, start_time, end_time);
-                }
-                None => {}
-            };
+            let start_time = Mono::now();
+            if counter < 5 {
+                ping.ping_a(ctx.shared.uart_sender).await
+            } else {
+                ping.ping_b(ctx.shared.uart_sender).await
+            }
+            let end_time = Mono::now();
+            util::log_duration(util::LogDurationTag::ClientLatency, start_time, end_time);
+
             util::log_heap();
             Mono::delay(1.millis()).await;
         }

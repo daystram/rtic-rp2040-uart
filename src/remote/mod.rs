@@ -3,7 +3,6 @@ pub mod transport;
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
-use defmt::error;
 use rtic_monotonics::Monotonic;
 use rtic_sync::channel::Receiver;
 use serde::{Deserialize, Serialize};
@@ -20,6 +19,7 @@ pub type ServiceId = u8;
 pub type MethodId = u8;
 
 pub trait Service: Send + Sync {
+    fn get_service_id(&self) -> ServiceId;
     fn dispatch(&mut self, method_id: MethodId, request: &[u8]) -> Vec<u8>;
 }
 
@@ -32,73 +32,60 @@ impl Executor {
         Executor { seq_receiver }
     }
 
-    pub fn register_service(&mut self, fun: MethodId, handler: Box<dyn Service>) {
+    pub fn register_service(&mut self, service: Box<dyn Service>) {
+        let service_id = service.get_service_id();
         cortex_m::interrupt::free(|cs| {
-            SERVICE_REGISTRY.borrow(cs).borrow_mut()[fun as usize] = Some(handler);
+            SERVICE_REGISTRY.borrow(cs).borrow_mut()[service_id as usize] = Some(service);
         });
     }
 
-    pub async fn listen<S>(&mut self, client: &RefCell<S>)
+    pub async fn listen<S>(&mut self, sender: &RefCell<S>)
     where
         S: TransportSender,
     {
-        while let Ok(seq) = self.seq_receiver.recv().await {
+        while let Ok(sequence) = self.seq_receiver.recv().await {
             let start_time = Mono::now();
+            let mut client = sender.borrow_mut();
 
-            // parse request payload
-            let packet = match cortex_m::interrupt::free(|cs| {
-                transport::PACKET_BUFFER.borrow(cs).borrow()[seq as usize]
-            }) {
-                Some(packet) => {
-                    // TODO: dropping here allows the freeing of heap early, but this somehow break packet.payload
-                    // warn!(
-                    //     "dropping on listen: size={}B",
-                    //     mem::size_of_val(packet.payload)
-                    // );
-                    // drop(unsafe { Box::from_raw(packet.payload as *const [u8] as *mut [u8]) });
-                    packet
-                }
-                None => {
-                    error!("packet not found in buffer: seq={}", seq);
+            // retrieve request
+            let (service_id, method_id, req, mut respond) = match client.get_payload(sequence) {
+                Ok(r) => r,
+                Err(err) => {
+                    defmt::error!("failed to retrieve request payload: {}", err);
                     return;
                 }
             };
 
             // execute function
-            let res = cortex_m::interrupt::free(|cs| {
-                if let Some(ref mut service) =
-                    SERVICE_REGISTRY.borrow(cs).borrow_mut()[packet.service_id as usize]
-                {
-                    service.dispatch(packet.method_id, packet.payload)
-                } else {
-                    error!("service not implemented: service_id={}", packet.service_id);
-                    Vec::new()
+            let res = match cortex_m::interrupt::free(|cs| {
+                SERVICE_REGISTRY.borrow(cs).borrow_mut()[service_id as usize]
+                    .as_mut()
+                    .map(|service| service.dispatch(method_id, req))
+            }) {
+                Some(res) => res,
+                None => {
+                    defmt::error!("service not implemented: service_id={}", service_id);
+                    return;
                 }
-            });
+            };
 
             // return response
-            client.borrow_mut().send_response(
-                packet.sequence,
-                packet.service_id,
-                packet.method_id,
-                res.as_slice(),
-            );
+            respond(&res);
 
             let end_time = Mono::now();
             util::log_duration(util::LogDurationTag::ServerLatency, start_time, end_time);
-
             util::log_heap();
         }
     }
 }
 
 pub trait RemoteInvoker {
-    async fn invoke<'b, Q, R>(
+    fn invoke<'b, Q, R>(
         &mut self,
         service_id: ServiceId,
         method_id: MethodId,
         request: Q,
-    ) -> R
+    ) -> impl core::future::Future<Output = R>
     where
         Q: Serialize,
         R: Deserialize<'b>;

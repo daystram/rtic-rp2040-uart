@@ -1,6 +1,6 @@
-use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 use core::cell::RefCell;
-use defmt::{error, info, trace, write, Format};
+use defmt::{error, write, Format};
 use rtic_monotonics::{rtic_time::monotonic::TimerQueueBasedInstant, Monotonic};
 use serde::{Deserialize, Serialize};
 
@@ -13,9 +13,9 @@ pub struct Ping {
     counter: u32,
 }
 
-pub const SERVICE_ID_PING: ServiceId = 0x01;
-pub const METHOD_ID_PING_A: MethodId = 0x01;
-pub const METHOD_ID_PING_B: MethodId = 0x02;
+const SERVICE_ID_PING: ServiceId = 0x01;
+const METHOD_ID_PING_A: MethodId = 0x01;
+const METHOD_ID_PING_B: MethodId = 0x02;
 
 impl Ping {
     pub fn new() -> Self {
@@ -34,7 +34,7 @@ impl Ping {
         };
         // info!("ping_a(): request: [{:?}]", req);
 
-        let res = client
+        client
             .borrow_mut()
             .invoke::<PingARequest, PingAResponse>(SERVICE_ID_PING, METHOD_ID_PING_A, req)
             .await;
@@ -62,7 +62,7 @@ impl Ping {
         };
         // info!("ping_b(): request: [{:?}]", req);
 
-        let res = client
+        client
             .borrow_mut()
             .invoke::<PingBRequest, PingBResponse>(SERVICE_ID_PING, METHOD_ID_PING_B, req)
             .await;
@@ -80,6 +80,10 @@ impl Ping {
 }
 
 impl Service for Ping {
+    fn get_service_id(&self) -> ServiceId {
+        SERVICE_ID_PING
+    }
+
     fn dispatch(&mut self, method_id: MethodId, request_buffer: &[u8]) -> Vec<u8> {
         // info!("Ping::dispatch()");
         match method_id {
