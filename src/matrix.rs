@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     kb::Mono,
     key::Edge,
-    transport::{self, RemoteInvoker, ServiceId, UartSender},
+    remote::{MethodId, RemoteInvoker, ServiceId},
 };
 
 #[derive(Clone, Copy, Debug, Format)]
@@ -61,7 +61,7 @@ impl<'a, const ROW_COUNT: usize, const COL_COUNT: usize> SplitSwitchMatrix<ROW_C
 }
 
 pub const SERVICE_ID_KEY_MATRIX: ServiceId = 0x10;
-const FUNCTION_ID_KEY_MATRIX_SCAN: transport::MethodId = 0x11;
+const FUNCTION_ID_KEY_MATRIX_SCAN: MethodId = 0x11;
 
 impl<const ROW_COUNT: usize, const COL_COUNT: usize> Scanner<ROW_COUNT, COL_COUNT>
     for SplitSwitchMatrix<ROW_COUNT, COL_COUNT>

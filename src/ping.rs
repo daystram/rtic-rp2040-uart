@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     kb::Mono,
-    transport::{MethodId, RemoteInvoker, Service, ServiceId},
+    remote::{MethodId, RemoteInvoker, Service, ServiceId},
 };
 
 pub struct Ping {
     counter: u32,
 }
 
-pub const SERVICE_ID_PING: MethodId = 0x01;
+pub const SERVICE_ID_PING: ServiceId = 0x01;
 pub const METHOD_ID_PING_A: MethodId = 0x01;
 pub const METHOD_ID_PING_B: MethodId = 0x02;
 

@@ -11,8 +11,8 @@ mod keyboard;
 mod matrix;
 mod ping;
 mod processor;
+mod remote;
 mod rotary;
-mod transport;
 mod util;
 
 extern crate alloc;
@@ -71,8 +71,14 @@ mod kb {
             mapper::{Input, Mapper},
             Event, EventsProcessor, InputProcessor,
         },
+        remote::{
+            transport::{
+                uart::{UartReceiver, UartSender},
+                TransportReceiver,
+            },
+            Executor,
+        },
         rotary::RotaryEncoder,
-        transport::{RemoteExecutor, TransportReceiver, UartReceiver, UartSender},
         util,
     };
 
@@ -126,7 +132,7 @@ mod kb {
         >,
         rotary_encoder: Option<RotaryEncoder>,
         heartbeat_led: HeartbeatLED,
-        remote_executor: RemoteExecutor,
+        remote_executor: Executor,
         uart_receiver: UartReceiver,
     }
 
@@ -250,12 +256,12 @@ mod kb {
         let ping = Some(Ping::new());
 
         // Initialize remote executor and register services
-        let mut remote_executor = RemoteExecutor::new(seq_sender);
+        let mut remote_executor = Executor::new(seq_sender);
         remote_executor.register_service(SERVICE_ID_PING, Box::new(Ping::new()));
 
         // Begin
         start_wait_usb::spawn(
-            500.millis(),
+            1.secs(),
             input_sender,
             input_receiver,
             keys_sender,
