@@ -1,10 +1,10 @@
 pub mod transport;
 
-use alloc::{boxed::Box, vec::Vec};
-use core::cell::RefCell;
-use cortex_m::interrupt::Mutex;
+use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use async_trait::async_trait;
+use core::cell::{LazyCell, RefCell};
 use rtic_monotonics::Monotonic;
-use rtic_sync::channel::Receiver;
+use rtic_sync::{arbiter::Arbiter, channel::Receiver};
 use serde::{Deserialize, Serialize};
 use transport::{Sequence, TransportSender};
 
@@ -12,15 +12,19 @@ use crate::{kb::Mono, util};
 
 pub const REQUEST_SEQUENCE_QUEUE_SIZE: usize = 1;
 
-static SERVICE_REGISTRY: Mutex<RefCell<[Option<Box<dyn Service>>; ServiceId::MAX as usize + 1]>> =
-    Mutex::new(RefCell::new([const { None }; ServiceId::MAX as usize + 1]));
+static SERVICE_REGISTRY: Arbiter<
+    LazyCell<Rc<RefCell<[Option<Box<dyn Service>>; ServiceId::MAX as usize + 1]>>>,
+> = Arbiter::new(LazyCell::new(|| {
+    Rc::new(RefCell::new([const { None }; ServiceId::MAX as usize + 1]))
+}));
 
 pub type ServiceId = u8;
 pub type MethodId = u8;
 
+#[async_trait]
 pub trait Service: Send + Sync {
     fn get_service_id(&self) -> ServiceId;
-    fn dispatch(&mut self, method_id: MethodId, request: &[u8]) -> Vec<u8>;
+    async fn dispatch(&mut self, method_id: MethodId, request: &[u8]) -> Vec<u8>;
 }
 
 pub struct Executor {
@@ -32,20 +36,19 @@ impl Executor {
         Executor { seq_receiver }
     }
 
-    pub fn register_service(&mut self, service: Box<dyn Service>) {
+    pub async fn register_service(&mut self, service: Box<dyn Service>) {
         let service_id = service.get_service_id();
-        cortex_m::interrupt::free(|cs| {
-            SERVICE_REGISTRY.borrow(cs).borrow_mut()[service_id as usize] = Some(service);
-        });
+        SERVICE_REGISTRY.access().await.as_ref().borrow_mut()[service_id as usize] = Some(service);
     }
 
-    pub async fn listen<S>(&mut self, sender: &RefCell<S>)
+    pub async fn listen<S>(&mut self, sender: &Arbiter<Rc<RefCell<S>>>)
     where
         S: TransportSender,
     {
         while let Ok(sequence) = self.seq_receiver.recv().await {
             let start_time = Mono::now();
-            let mut client = sender.borrow_mut();
+            let c = sender.access().await;
+            let mut client = c.as_ref().borrow_mut();
 
             // retrieve request
             let (service_id, method_id, req, mut respond) = match client.get_payload(sequence) {
@@ -57,17 +60,14 @@ impl Executor {
             };
 
             // execute function
-            let res = match cortex_m::interrupt::free(|cs| {
-                SERVICE_REGISTRY.borrow(cs).borrow_mut()[service_id as usize]
-                    .as_mut()
-                    .map(|service| service.dispatch(method_id, req))
-            }) {
-                Some(res) => res,
-                None => {
-                    defmt::error!("service not implemented: service_id={}", service_id);
-                    return;
-                }
-            };
+            let res =
+                match SERVICE_REGISTRY.access().await.as_ref().borrow_mut()[service_id as usize] {
+                    Some(ref mut service) => service.dispatch(method_id, req).await,
+                    None => {
+                        defmt::error!("service not implemented: service_id={}", service_id);
+                        return;
+                    }
+                };
 
             // return response
             respond(&res);

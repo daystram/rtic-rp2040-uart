@@ -4,7 +4,11 @@
 #![feature(associated_type_defaults)]
 #![feature(trait_alias)]
 #![feature(async_closure)]
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
+#![allow(refining_impl_trait)]
 #![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
 mod heartbeat;
 mod key;
 mod keyboard;
@@ -38,16 +42,19 @@ mod kb {
     static mut HEAP_MEM: [core::mem::MaybeUninit<u8>; HEAP_SIZE_BYTES] =
         [core::mem::MaybeUninit::uninit(); HEAP_SIZE_BYTES];
 
-    use alloc::{boxed::Box, vec::Vec};
+    use alloc::{boxed::Box, rc::Rc, vec::Vec};
     use core::cell::RefCell;
-    use defmt::{debug, error, info, trace, warn, Format};
+    use defmt::Format;
     use hal::{
         clocks::{init_clocks_and_plls, Clock},
         fugit::RateExtU32,
         gpio, pwm, sio, uart, usb, Sio, Watchdog,
     };
     use rtic_monotonics::{rp2040::prelude::*, Monotonic};
-    use rtic_sync::channel::{Receiver, Sender};
+    use rtic_sync::{
+        arbiter::Arbiter,
+        channel::{Receiver, Sender},
+    };
     use usb_device::{
         bus::UsbBusAllocator,
         device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
@@ -113,7 +120,7 @@ mod kb {
     struct Shared {
         is_usb_connected: bool,
         mode: Mode,
-        uart_sender: RefCell<UartSender>,
+        uart_sender: Arbiter<Rc<RefCell<UartSender>>>,
         usb_device: UsbDevice<'static, usb::UsbBus>,
         usb_keyboard: UsbHidClass<
             'static,
@@ -124,12 +131,6 @@ mod kb {
 
     #[local]
     struct Local {
-        key_matrix: Option<
-            SplitSwitchMatrix<
-                { keyboard::KEY_MATRIX_ROW_COUNT },
-                { keyboard::KEY_MATRIX_COL_COUNT },
-            >,
-        >,
         rotary_encoder: Option<RotaryEncoder>,
         heartbeat_led: HeartbeatLED,
         uart_receiver: UartReceiver,
@@ -137,7 +138,7 @@ mod kb {
 
     #[init(local = [usb_allocator: Option<UsbBusAllocator<usb::UsbBus>> = None])]
     fn init(mut ctx: init::Context) -> (Shared, Local) {
-        info!("init()");
+        defmt::info!("init()");
 
         // Soft-reset does not release the hardware spinlocks.
         // Release them now to avoid a deadlock after debug or watchdog reset.
@@ -190,7 +191,7 @@ mod kb {
         let heartbeat_led = HeartbeatLED::new(Box::new(slices.pwm6.channel_b));
 
         // Init HID device
-        info!("init usb allocator");
+        defmt::info!("init usb allocator");
         let usb_allocator = ctx
             .local
             .usb_allocator
@@ -202,12 +203,12 @@ mod kb {
                 &mut ctx.device.RESETS,
             )));
 
-        info!("init usb keyboard");
+        defmt::info!("init usb keyboard");
         let usb_keyboard = UsbHidClassBuilder::new()
             .add_device(NKROBootKeyboardConfig::default())
             .build(usb_allocator);
 
-        info!("init usb device");
+        defmt::info!("init usb device");
         let usb_device = UsbDeviceBuilder::new(usb_allocator, UsbVidPid(0x1111, 0x1111))
             .strings(&[StringDescriptors::default()
                 .manufacturer("daystram")
@@ -235,24 +236,20 @@ mod kb {
         .unwrap();
         uart_peripheral.set_fifos(true);
         let (uart_reader, uart_writer) = uart_peripheral.split();
-        let uart_sender = RefCell::new(UartSender::new(uart_writer));
+        let uart_sender = Arbiter::new(Rc::new(RefCell::new(UartSender::new(uart_writer))));
         let mut uart_receiver = UartReceiver::new(uart_reader);
         let seq_sender = uart_receiver.initialize_seq_sender();
 
         // Init keyboard
-        // let key_matrix = Some(SplitSwitchMatrix::new(BasicVerticalSwitchMatrix::new(
-        //     [
-        //         Box::new(pins.gpio21.into_pull_down_input()),
-        //         Box::new(pins.gpio20.into_pull_down_input()),
-        //     ],
-        //     [
-        //         Box::new(pins.gpio10.into_push_pull_output()),
-        //         Box::new(pins.gpio11.into_push_pull_output()),
-        //     ],
-        // )));
-        let key_matrix = None;
+        let key_matrix = Some(SplitSwitchMatrix::new(BasicVerticalSwitchMatrix::new(
+            [
+                Box::new(pins.gpio16.into_pull_down_input()),
+                Box::new(pins.gpio15.into_pull_down_input()),
+            ],
+            [Box::new(pins.gpio14.into_push_pull_output())],
+        )));
         let rotary_encoder = None;
-        let ping = Some(Ping::new());
+        let ping = None;
 
         // Begin
         start_wait_usb::spawn(
@@ -265,10 +262,11 @@ mod kb {
             frame_receiver,
             seq_sender,
             ping,
+            key_matrix,
         )
         .ok();
 
-        info!("init() done");
+        defmt::info!("init() done");
         (
             Shared {
                 is_usb_connected: false,
@@ -278,7 +276,6 @@ mod kb {
                 usb_keyboard,
             },
             Local {
-                key_matrix,
                 rotary_encoder,
                 heartbeat_led,
                 uart_receiver,
@@ -288,7 +285,7 @@ mod kb {
 
     #[idle()]
     fn idle(_ctx: idle::Context) -> ! {
-        info!("idle()");
+        defmt::info!("idle()");
         loop {
             // https://developer.arm.com/documentation/ddi0406/c/Application-Level-Architecture/Instruction-Details/Alphabetical-list-of-instructions/WFI
             rtic::export::wfi()
@@ -316,8 +313,14 @@ mod kb {
         _frame_receiver: Receiver<'static, Box<dyn FrameIterator>, 1>,
         seq_sender: Receiver<'static, Sequence, { remote::REQUEST_SEQUENCE_QUEUE_SIZE }>,
         ping: Option<Ping>,
+        key_matrix: Option<
+            SplitSwitchMatrix<
+                { keyboard::KEY_MATRIX_ROW_COUNT },
+                { keyboard::KEY_MATRIX_COL_COUNT },
+            >,
+        >,
     ) {
-        info!("start_wait_usb()");
+        defmt::info!("start_wait_usb()");
 
         // Start USB tasks
         hid_usb_tick::spawn().ok();
@@ -335,7 +338,7 @@ mod kb {
             };
             *m = mode;
         });
-        warn!("detected as {}", mode);
+        defmt::warn!("detected as {}", mode);
 
         match mode {
             Mode::Master => {
@@ -343,50 +346,52 @@ mod kb {
                 if let Some(ping) = ping {
                     master_ping::spawn(ping).ok();
                 }
-                // master_input_scanner::spawn(input_sender).ok();
-                // master_processor::spawn(input_receiver, keys_sender, frame_sender).ok();
+                master_input_scanner::spawn(key_matrix, input_sender).ok();
+                master_processor::spawn(input_receiver, keys_sender, frame_sender).ok();
             }
             Mode::Slave => {
                 // Initialize remote executor and register services
                 let mut remote_executor = Executor::new(seq_sender);
                 if let Some(ping) = ping {
-                    remote_executor.register_service(Box::new(ping));
+                    remote_executor.register_service(Box::new(ping)).await;
+                }
+                if let Some(key_matrix) = key_matrix {
+                    remote_executor.register_service(Box::new(key_matrix)).await;
                 }
 
                 heartbeat::spawn(100.millis()).ok();
                 slave_server::spawn(remote_executor).ok();
             }
-            _ => panic!("unsupported mode: {mode:?}"),
+            _ => core::panic!("unsupported mode: {mode:?}"),
         }
         unsafe { hal::pac::NVIC::unmask(hal::pac::Interrupt::UART0_IRQ) }
     }
 
     #[task(local=[heartbeat_led], priority = 2)]
     async fn heartbeat(ctx: heartbeat::Context, period: <Mono as Monotonic>::Duration) {
-        info!("heartbeat()");
+        defmt::info!("heartbeat()");
         ctx.local.heartbeat_led.cycle(period).await
     }
 
     #[task(binds = UART0_IRQ, local = [uart_receiver], priority = 1)]
     fn receive_uart(ctx: receive_uart::Context) {
-        // warn!("UART0_IRQ start");
-
-        let start_time = Mono::now();
+        // defmt::warn!("UART0_IRQ start");
+        // let start_time = Mono::now();
         ctx.local.uart_receiver.read_into_buffer();
-        let end_time = Mono::now();
-        util::log_duration(
-            util::LogDurationTag::UARTIRQRecieveBuffer,
-            start_time,
-            end_time,
-        );
-        // warn!("UART0_IRQ done");
+        // let end_time = Mono::now();
+        // util::log_duration(
+        //     util::LogDurationTag::UARTIRQRecieveBuffer,
+        //     start_time,
+        //     end_time,
+        // );
+        // defmt::warn!("UART0_IRQ done");
     }
     // ============================= Master and Slave
 
     // ============================= Slave
     #[task (shared=[&uart_sender], priority = 1)]
     async fn slave_server(ctx: slave_server::Context, mut remote_executor: Executor) {
-        info!("slave_server()");
+        defmt::info!("slave_server()");
         remote_executor.listen(ctx.shared.uart_sender).await;
     }
     // ============================= Slave
@@ -394,42 +399,43 @@ mod kb {
     // ============================= Master
     #[task (shared=[&uart_sender], priority = 1)]
     async fn master_ping(ctx: master_ping::Context, mut ping: Ping) {
-        info!("master_ping()");
+        defmt::info!("master_ping()");
         let mut counter = 0u8;
         loop {
-            // counter = (counter + 1) % 10;
-            let start_time = Mono::now();
+            counter = (counter + 1) % 10;
             if counter < 5 {
                 ping.ping_a(ctx.shared.uart_sender).await
             } else {
                 ping.ping_b(ctx.shared.uart_sender).await
             }
-            let end_time = Mono::now();
-            util::log_duration(util::LogDurationTag::ClientLatency, start_time, end_time);
-
-            util::log_heap();
-            Mono::delay(1.millis()).await;
+            Mono::delay(10.millis()).await;
         }
     }
 
-    #[task (shared=[&uart_sender], local=[key_matrix, rotary_encoder], priority = 1)]
+    #[task (shared=[&uart_sender], local=[rotary_encoder], priority = 1)]
     async fn master_input_scanner(
         ctx: master_input_scanner::Context,
+        mut key_matrix: Option<
+            SplitSwitchMatrix<
+                { keyboard::KEY_MATRIX_ROW_COUNT },
+                { keyboard::KEY_MATRIX_COL_COUNT },
+            >,
+        >,
         mut input_sender: Sender<
             'static,
             Input<{ keyboard::KEY_MATRIX_ROW_COUNT }, { keyboard::KEY_MATRIX_COL_COUNT }>,
             INPUT_CHANNEL_BUFFER_SIZE,
         >,
     ) {
-        info!("master_input_scanner()");
+        defmt::info!("master_input_scanner()");
         let mut poll_end_time = Mono::now();
         let mut n: u64 = 0;
         loop {
             let scan_start_time = Mono::now();
 
             let uart_sender = ctx.shared.uart_sender;
-            let key_matrix_result = match ctx.local.key_matrix {
-                Some(key_matrix) => key_matrix.scan(uart_sender).await,
+            let key_matrix_result = match key_matrix {
+                Some(ref mut key_matrix) => key_matrix.scan(uart_sender).await,
                 None => Default::default(),
             };
             let rotary_encoder_result = match ctx.local.rotary_encoder {
@@ -446,7 +452,7 @@ mod kb {
 
             if DEBUG_LOG_INPUT_SCANNER_ENABLE_TIMING && n % DEBUG_LOG_INPUT_SCANNER_INTERVAL == 0 {
                 let scan_end_time = Mono::now();
-                debug!(
+                defmt::debug!(
                     "[{}] input_scanner: {} us\tpoll: {} us\trate: {} Hz\t budget: {} %",
                     n,
                     (scan_end_time - scan_start_time).to_micros(),
@@ -458,6 +464,13 @@ mod kb {
             }
 
             poll_end_time = Mono::now();
+            util::log_duration(
+                util::LogDurationTag::ClientLatency,
+                scan_start_time,
+                poll_end_time,
+            );
+            util::log_heap();
+
             n = n.wrapping_add(1);
             Mono::delay_until(scan_start_time + INPUT_SCANNER_TARGET_POLL_PERIOD_MICROS.micros())
                 .await;
@@ -475,7 +488,7 @@ mod kb {
         mut keys_sender: Sender<'static, Vec<Key>, KEYS_CHANNEL_BUFFER_SIZE>,
         _frame_sender: Sender<'static, Box<dyn FrameIterator>, 1>,
     ) {
-        info!("master_processor()");
+        defmt::info!("master_processor()");
         let input_processors: &mut [&mut dyn InputProcessor<
             { keyboard::KEY_MATRIX_ROW_COUNT },
             { keyboard::KEY_MATRIX_COL_COUNT },
@@ -504,7 +517,9 @@ mod kb {
                 events
                     .iter()
                     .filter(|e| e.edge != Edge::None)
-                    .for_each(|e| debug!("[{}] event: action: {} edge: {}", n, e.action, e.edge));
+                    .for_each(|e| {
+                        defmt::debug!("[{}] event: action: {} edge: {}", n, e.action, e.edge)
+                    });
             }
 
             if events_processors
@@ -529,7 +544,7 @@ mod kb {
 
             if DEBUG_LOG_PROCESSOR_ENABLE_TIMING && (n % DEBUG_LOG_PROCESSOR_INTERVAL == 0) {
                 let scan_end_time = Mono::now();
-                debug!(
+                defmt::debug!(
                     "[{}] processor: {} us\tpoll: {} us\trate: {} Hz\t budget: {} %",
                     n,
                     (scan_end_time - process_start_time).to_micros(),
@@ -550,11 +565,11 @@ mod kb {
         mut ctx: hid_reporter::Context,
         mut keys_receiver: Receiver<'static, Vec<Key>, KEYS_CHANNEL_BUFFER_SIZE>,
     ) {
-        info!("hid_reporter()");
+        defmt::info!("hid_reporter()");
         while let Ok(keys) = keys_receiver.recv().await {
             let start_time = Mono::now();
             if DEBUG_LOG_SENT_KEYS {
-                debug!("keys: {:?}", keys.as_slice());
+                defmt::debug!("keys: {:?}", keys.as_slice());
             }
 
             ctx.shared.usb_keyboard.lock(|k| {
@@ -579,7 +594,7 @@ mod kb {
                 *is_usb_connected = true; // usb connection detected
                 match usb_keyboard.device().read_report() {
                     Ok(leds) => {
-                        debug!(
+                        defmt::debug!(
                             "\nnum_lock: {}\ncaps_lock: {}\nscroll_lock: {}\ncompose: {}\nkana: {}\n",
                             leds.num_lock,
                             leds.caps_lock,
@@ -602,7 +617,7 @@ mod kb {
         priority = 1,
     )]
     async fn hid_usb_tick(mut ctx: hid_usb_tick::Context) {
-        info!("hid_usb_tick()");
+        defmt::info!("hid_usb_tick()");
         loop {
             ctx.shared.usb_keyboard.lock(|k| match k.tick() {
                 Ok(_) => {}

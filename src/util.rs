@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use alloc::boxed::Box;
-use defmt::{debug, error, trace, Format};
+use defmt::Format;
 use embedded_hal::{digital::OutputPin, pwm::SetDutyCycle};
 use hal::gpio;
 use rtic_monotonics::rp2040::prelude::*;
@@ -50,8 +50,8 @@ pub async fn lerp(
 
 const ENABLE_LOG_HEAP: bool = true;
 const ENABLE_LOG_DURATION: bool = true;
-const LOG_HEAP_RATE: u32 = 1000;
-const LOG_DURATION_RATE: u32 = 100;
+const LOG_HEAP_RATE: u32 = 5000;
+const LOG_DURATION_RATE: u32 = 1000;
 
 static mut LOG_HEAP_COUNTER: u32 = 0;
 
@@ -64,7 +64,7 @@ pub fn log_heap() {
         LOG_HEAP_COUNTER
     };
     if counter % LOG_HEAP_RATE == 0 {
-        error!(
+        defmt::error!(
             "[{}] ========= heap stat: free={}B used={}B",
             counter,
             HEAP.free(),
@@ -96,7 +96,7 @@ pub fn log_duration(
         LOG_DURATION_COUNTER[tag as usize]
     };
     if counter % LOG_DURATION_RATE == 0 {
-        trace!(
+        defmt::trace!(
             "[{}] ========= {}: {}us",
             counter,
             tag,

@@ -1,7 +1,9 @@
-use alloc::{format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
+use async_trait::async_trait;
 use core::cell::RefCell;
-use defmt::{error, write, Format};
+use defmt::{write, Format};
 use rtic_monotonics::{rtic_time::monotonic::TimerQueueBasedInstant, Monotonic};
+use rtic_sync::arbiter::Arbiter;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -22,7 +24,7 @@ impl Ping {
         Ping { counter: 0 }
     }
 
-    pub async fn ping_a<I>(&mut self, client: &RefCell<I>)
+    pub async fn ping_a<I>(&mut self, client: &Arbiter<Rc<RefCell<I>>>)
     where
         I: RemoteInvoker,
     {
@@ -35,6 +37,8 @@ impl Ping {
         // info!("ping_a(): request: [{:?}]", req);
 
         client
+            .access()
+            .await
             .borrow_mut()
             .invoke::<PingARequest, PingAResponse>(SERVICE_ID_PING, METHOD_ID_PING_A, req)
             .await;
@@ -49,7 +53,7 @@ impl Ping {
         }
     }
 
-    pub async fn ping_b<I>(&mut self, client: &RefCell<I>)
+    pub async fn ping_b<I>(&mut self, client: &Arbiter<Rc<RefCell<I>>>)
     where
         I: RemoteInvoker,
     {
@@ -63,6 +67,8 @@ impl Ping {
         // info!("ping_b(): request: [{:?}]", req);
 
         client
+            .access()
+            .await
             .borrow_mut()
             .invoke::<PingBRequest, PingBResponse>(SERVICE_ID_PING, METHOD_ID_PING_B, req)
             .await;
@@ -79,12 +85,13 @@ impl Ping {
     }
 }
 
+#[async_trait]
 impl Service for Ping {
     fn get_service_id(&self) -> ServiceId {
         SERVICE_ID_PING
     }
 
-    fn dispatch(&mut self, method_id: MethodId, request_buffer: &[u8]) -> Vec<u8> {
+    async fn dispatch(&mut self, method_id: MethodId, request_buffer: &[u8]) -> Vec<u8> {
         // info!("Ping::dispatch()");
         match method_id {
             METHOD_ID_PING_A => {
@@ -98,7 +105,7 @@ impl Service for Ping {
                 postcard::to_allocvec(&response).unwrap()
             }
             _ => {
-                error!("unimplemented");
+                defmt::error!("unimplemented");
                 Vec::new()
             }
         }

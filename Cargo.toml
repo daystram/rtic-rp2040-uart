@@ -29,6 +29,7 @@ enum-map = "2.7.3"
 serde = { version = "1.0.204", default-features = false, features = ["derive"] }
 postcard = { version = "1.0.8", features = ["alloc"] }
 nb = "1.1.0"
+async-trait = "0.1.81"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
