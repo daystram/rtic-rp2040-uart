@@ -2,11 +2,11 @@ CARGO:=$(shell which cargo)
 
 all:
 
-.PHONY: run_master
-run_master:
-	${CARGO} run -- --probe ${MASTER_PROBE}
+.PHONY: run_left
+run_left:
+	${CARGO} run -- --probe ${LEFT_PROBE}
 
 
-.PHONY: run_slave
-run_slave:
-	${CARGO} run -- --probe ${SLAVE_PROBE}
+.PHONY: run_right
+run_right:
+	${CARGO} run -- --probe ${RIGHT_PROBE}

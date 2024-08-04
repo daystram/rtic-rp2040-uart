@@ -79,6 +79,7 @@ pub enum LogDurationTag {
     ClientLatency,
     ServerLatency,
     UARTIRQRecieveBuffer,
+    KeyMatrixScan,
 }
 
 static mut LOG_DURATION_COUNTER: [u32; u8::MAX as usize] = [0; u8::MAX as usize];

@@ -17,6 +17,7 @@ mod ping;
 mod processor;
 mod remote;
 mod rotary;
+mod split;
 mod util;
 
 extern crate alloc;
@@ -44,7 +45,6 @@ mod kb {
 
     use alloc::{boxed::Box, rc::Rc, vec::Vec};
     use core::cell::RefCell;
-    use defmt::Format;
     use hal::{
         clocks::{init_clocks_and_plls, Clock},
         fugit::RateExtU32,
@@ -55,6 +55,7 @@ mod kb {
         arbiter::Arbiter,
         channel::{Receiver, Sender},
     };
+    use split::SideDetector;
     use usb_device::{
         bus::UsbBusAllocator,
         device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid},
@@ -87,15 +88,9 @@ mod kb {
             Executor,
         },
         rotary::RotaryEncoder,
+        split::{self, Mode},
         util,
     };
-
-    #[derive(Clone, Copy, Debug, Format, PartialEq, PartialOrd)]
-    pub enum Mode {
-        None,
-        Master,
-        Slave,
-    }
 
     rp2040_timer_monotonic!(Mono);
 
@@ -119,7 +114,6 @@ mod kb {
     #[shared]
     struct Shared {
         is_usb_connected: bool,
-        mode: Mode,
         uart_sender: Arbiter<Rc<RefCell<UartSender>>>,
         usb_device: UsbDevice<'static, usb::UsbBus>,
         usb_keyboard: UsbHidClass<
@@ -240,6 +234,9 @@ mod kb {
         let mut uart_receiver = UartReceiver::new(uart_reader);
         let seq_sender = uart_receiver.initialize_seq_sender();
 
+        // Detect side
+        SideDetector::new(Box::new(pins.gpio2.into_pull_down_input())).detect();
+
         // Init keyboard
         let key_matrix = Some(SplitSwitchMatrix::new(BasicVerticalSwitchMatrix::new(
             [
@@ -270,7 +267,6 @@ mod kb {
         (
             Shared {
                 is_usb_connected: false,
-                mode: Mode::None,
                 uart_sender,
                 usb_device,
                 usb_keyboard,
@@ -293,9 +289,9 @@ mod kb {
     }
 
     // ============================= Master and Slave
-    #[task(shared=[is_usb_connected, mode], priority = 1)]
+    #[task(shared=[is_usb_connected], priority = 1)]
     async fn start_wait_usb(
-        ctx: start_wait_usb::Context,
+        mut ctx: start_wait_usb::Context,
         timeout: <Mono as Monotonic>::Duration,
         input_sender: Sender<
             'static,
@@ -329,18 +325,20 @@ mod kb {
 
         Mono::delay(timeout).await;
 
-        let mut mode = Mode::None;
-        (ctx.shared.is_usb_connected, ctx.shared.mode).lock(|is_usb_connected, m| {
-            mode = if *is_usb_connected {
+        split::set_self_mode(ctx.shared.is_usb_connected.lock(|is_usb_connected| {
+            if *is_usb_connected {
                 Mode::Master
             } else {
                 Mode::Slave
-            };
-            *m = mode;
-        });
-        defmt::warn!("detected as {}", mode);
+            }
+        }));
+        defmt::warn!(
+            "detected as {} {}",
+            split::get_self_mode(),
+            split::get_self_side()
+        );
 
-        match mode {
+        match split::get_self_mode() {
             Mode::Master => {
                 heartbeat::spawn(20.millis()).ok();
                 if let Some(ping) = ping {
@@ -362,7 +360,6 @@ mod kb {
                 heartbeat::spawn(100.millis()).ok();
                 slave_server::spawn(remote_executor).ok();
             }
-            _ => core::panic!("unsupported mode: {mode:?}"),
         }
         unsafe { hal::pac::NVIC::unmask(hal::pac::Interrupt::UART0_IRQ) }
     }

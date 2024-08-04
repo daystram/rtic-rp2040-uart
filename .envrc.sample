@@ -1,3 +1,3 @@
 # VID, PID, and Serial are obtained from `probe-rs list`
-export MASTER_PROBE="vid:pid:serial"
-export SLAVE_PROBE="vid:pid:serial"
+export LEFT_PROBE="vid:pid:serial"
+export RIGHT_PROBE="vid:pid:serial"

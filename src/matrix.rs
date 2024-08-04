@@ -12,42 +12,13 @@ use crate::{
     kb::Mono,
     key::Edge,
     remote::{MethodId, RemoteInvoker, Service, ServiceId},
+    split, util,
 };
 
 #[derive(Clone, Copy, Debug, Format)]
 pub struct Result<const ROW_COUNT: usize, const COL_COUNT: usize> {
     pub scan_time_ticks: u64,
     pub matrix: [[Bit; COL_COUNT]; ROW_COUNT],
-}
-
-impl<const ROW_COUNT: usize, const COL_COUNT: usize> Result<ROW_COUNT, COL_COUNT> {
-    pub fn merge<const OTHER_COL_COUNT: usize>(
-        self,
-        other: Result<{ ROW_COUNT }, { OTHER_COL_COUNT }>,
-    ) -> Result<ROW_COUNT, { COL_COUNT + OTHER_COL_COUNT }>
-    where
-        [(); COL_COUNT + OTHER_COL_COUNT]:,
-    {
-        let mut merged_matrix = [[Bit {
-            edge: Edge::None,
-            pressed: false,
-        }; COL_COUNT + OTHER_COL_COUNT]; ROW_COUNT];
-
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..ROW_COUNT {
-            for j in 0..COL_COUNT {
-                merged_matrix[i][j] = self.matrix[i][j];
-            }
-            for j in 0..OTHER_COL_COUNT {
-                merged_matrix[i][j + COL_COUNT] = other.matrix[i][j];
-            }
-        }
-
-        Result {
-            scan_time_ticks: self.scan_time_ticks,
-            matrix: merged_matrix,
-        }
-    }
 }
 
 impl<const ROW_COUNT: usize, const COL_COUNT: usize> Serialize for Result<ROW_COUNT, COL_COUNT> {
@@ -161,7 +132,11 @@ where
     [(); COL_COUNT / 2]:,
 {
     async fn scan(&mut self) -> Result<ROW_COUNT, { COL_COUNT / 2 }> {
-        self.local_matrix.scan().await
+        let start_time = Mono::now();
+        let result = self.local_matrix.scan().await;
+        let end_time = Mono::now();
+        util::log_duration(util::LogDurationTag::KeyMatrixScan, start_time, end_time);
+        result
     }
 }
 
@@ -174,7 +149,7 @@ where
     where
         I: RemoteInvoker,
     {
-        let res = client
+        let remote_result = client
             .access()
             .await
             .borrow_mut()
@@ -183,12 +158,8 @@ where
                 METHOD_ID_KEY_MATRIX_SCAN,
                 SwitchMatrixScanRequest {},
             )
-            .await;
-        let remote_result: Result<{ ROW_COUNT }, { COL_COUNT / 2 }> = res.result;
+            .await.result;
         let local_result: Result<{ ROW_COUNT }, { COL_COUNT / 2 }> = Scanner::scan(self).await;
-
-        // let merged_result = remote_result.merge(local_result);
-        // merged_result
 
         // merge
         let mut merged_matrix = [[Bit {
@@ -196,11 +167,15 @@ where
             pressed: false,
         }; COL_COUNT]; ROW_COUNT];
 
+        let (left_matrix, right_matrix) = match split::get_self_side() {
+            split::Side::Left => (local_result.matrix, remote_result.matrix),
+            split::Side::Right => (remote_result.matrix, local_result.matrix),
+        };
         #[allow(clippy::needless_range_loop)]
         for i in 0..ROW_COUNT {
             for j in 0..(COL_COUNT / 2) {
-                merged_matrix[i][j] = local_result.matrix[i][j];
-                merged_matrix[i][j + COL_COUNT / 2] = remote_result.matrix[i][j];
+                merged_matrix[i][j] = left_matrix[i][j];
+                merged_matrix[i][j + COL_COUNT / 2] = right_matrix[i][j];
             }
         }
 
