@@ -3,6 +3,7 @@ pub mod transport;
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use async_trait::async_trait;
 use core::cell::{LazyCell, RefCell};
+use defmt::Format;
 use rtic_monotonics::Monotonic;
 use rtic_sync::{arbiter::Arbiter, channel::Receiver};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,13 @@ pub type MethodId = u8;
 #[async_trait]
 pub trait Service: Send + Sync {
     fn get_service_id(&self) -> ServiceId;
-    async fn dispatch(&mut self, method_id: MethodId, request: &[u8]) -> Vec<u8>;
+    async fn dispatch(&mut self, method_id: MethodId, request: &[u8]) -> Result<Vec<u8>, Error>;
+}
+
+#[derive(Clone, Copy, Debug, Format, PartialEq)]
+pub enum Error {
+    ResponseSerializationFailed,
+    MethodUnimplemented,
 }
 
 pub struct Executor {
@@ -59,15 +66,22 @@ impl Executor {
                 }
             };
 
-            // execute function
-            let res =
-                match SERVICE_REGISTRY.access().await.as_ref().borrow_mut()[service_id as usize] {
-                    Some(ref mut service) => service.dispatch(method_id, req).await,
-                    None => {
-                        defmt::error!("service not implemented: service_id={}", service_id);
-                        return;
-                    }
-                };
+            // execute
+            let res = match match SERVICE_REGISTRY.access().await.as_ref().borrow_mut()
+                [service_id as usize]
+            {
+                Some(ref mut service) => service.dispatch(method_id, req).await,
+                None => {
+                    defmt::error!("service not implemented: service_id={}", service_id);
+                    return;
+                }
+            } {
+                Ok(res) => res,
+                Err(err) => {
+                    defmt::error!("failed to execute method: {}", err);
+                    return;
+                }
+            };
 
             // return response
             respond(&res);

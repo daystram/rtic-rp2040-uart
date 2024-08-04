@@ -5,6 +5,7 @@
 #![feature(trait_alias)]
 #![feature(async_closure)]
 #![feature(generic_const_exprs)]
+#![feature(future_join)]
 #![allow(incomplete_features)]
 #![allow(refining_impl_trait)]
 #![allow(clippy::type_complexity)]

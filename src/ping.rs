@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     kb::Mono,
-    remote::{MethodId, RemoteInvoker, Service, ServiceId},
+    remote::{self, MethodId, RemoteInvoker, Service, ServiceId},
 };
 
 pub struct Ping {
@@ -91,23 +91,28 @@ impl Service for Ping {
         SERVICE_ID_PING
     }
 
-    async fn dispatch(&mut self, method_id: MethodId, request_buffer: &[u8]) -> Vec<u8> {
+    async fn dispatch(
+        &mut self,
+        method_id: MethodId,
+        request_buffer: &[u8],
+    ) -> core::result::Result<Vec<u8>, remote::Error> {
         // info!("Ping::dispatch()");
         match method_id {
             METHOD_ID_PING_A => {
                 let request: PingARequest = postcard::from_bytes(request_buffer).unwrap();
-                let response = self.service_ping_a(request);
-                postcard::to_allocvec(&response).unwrap()
+                match postcard::to_allocvec(&self.service_ping_a(request)) {
+                    Ok(res) => core::result::Result::Ok(res),
+                    Err(_) => core::result::Result::Err(remote::Error::ResponseSerializationFailed),
+                }
             }
             METHOD_ID_PING_B => {
                 let request: PingBRequest = postcard::from_bytes(request_buffer).unwrap();
-                let response = self.service_ping_b(request);
-                postcard::to_allocvec(&response).unwrap()
+                match postcard::to_allocvec(&self.service_ping_b(request)) {
+                    Ok(res) => core::result::Result::Ok(res),
+                    Err(_) => core::result::Result::Err(remote::Error::ResponseSerializationFailed),
+                }
             }
-            _ => {
-                defmt::error!("unimplemented");
-                Vec::new()
-            }
+            _ => core::result::Result::Err(remote::Error::MethodUnimplemented),
         }
     }
 }

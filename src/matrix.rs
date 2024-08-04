@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use async_trait::async_trait;
-use core::cell::RefCell;
+use core::{cell::RefCell, future};
 use defmt::Format;
 use embedded_hal::digital::{InputPin, OutputPin};
 use rp2040_hal::gpio;
@@ -11,7 +11,7 @@ use serde::{de, ser::SerializeStruct, Deserialize, Serialize};
 use crate::{
     kb::Mono,
     key::Edge,
-    remote::{MethodId, RemoteInvoker, Service, ServiceId},
+    remote::{self, MethodId, RemoteInvoker, Service, ServiceId},
     split, util,
 };
 
@@ -149,7 +149,7 @@ where
     where
         I: RemoteInvoker,
     {
-        let remote_result = client
+        let (remote_response, local_result) = future::join!(client
             .access()
             .await
             .borrow_mut()
@@ -157,9 +157,7 @@ where
                 SERVICE_ID_KEY_MATRIX,
                 METHOD_ID_KEY_MATRIX_SCAN,
                 SwitchMatrixScanRequest {},
-            )
-            .await.result;
-        let local_result: Result<{ ROW_COUNT }, { COL_COUNT / 2 }> = Scanner::scan(self).await;
+            ), Scanner::scan(self)).await;
 
         // merge
         let mut merged_matrix = [[Bit {
@@ -168,8 +166,8 @@ where
         }; COL_COUNT]; ROW_COUNT];
 
         let (left_matrix, right_matrix) = match split::get_self_side() {
-            split::Side::Left => (local_result.matrix, remote_result.matrix),
-            split::Side::Right => (remote_result.matrix, local_result.matrix),
+            split::Side::Left => (local_result.matrix, remote_response.result.matrix),
+            split::Side::Right => (remote_response.result.matrix, local_result.matrix),
         };
         #[allow(clippy::needless_range_loop)]
         for i in 0..ROW_COUNT {
@@ -196,17 +194,20 @@ where
         SERVICE_ID_KEY_MATRIX
     }
 
-    async fn dispatch(&mut self, method_id: MethodId, _request_buffer: &[u8]) -> Vec<u8> {
-        // info!("Ping::dispatch()");
+    async fn dispatch(
+        &mut self,
+        method_id: MethodId,
+        _request_buffer: &[u8],
+    ) -> core::result::Result<Vec<u8>, remote::Error> {
         match method_id {
             METHOD_ID_KEY_MATRIX_SCAN => {
                 let result = Scanner::scan(self).await;
-                postcard::to_allocvec(&SwitchMatrixScanResponse { result }).unwrap()
+                match postcard::to_allocvec(&SwitchMatrixScanResponse { result }) {
+                    Ok(res) => core::result::Result::Ok(res),
+                    Err(_) => core::result::Result::Err(remote::Error::ResponseSerializationFailed),
+                }
             }
-            _ => {
-                defmt::error!("unimplemented");
-                Vec::new()
-            }
+            _ => core::result::Result::Err(remote::Error::MethodUnimplemented),
         }
     }
 }
